@@ -26,3 +26,18 @@ pip install pandas numpy
 You only need to write a single function that returns `1` (Buy), `-1` (Sell), or `0` (Hold) in a DataFrame column named `signal`. The engine handles the rest.
 
 Check out `example_usage.py` for a complete working template.
+
+## Zero Look-Ahead Bias Guarantee
+One of the most common pitfalls in quantitative research is accidentally executing a trade at the closing price of the candle that generated the signal. This engine strictly enforces execution on the **NEXT candle's Open price**. 
+
+*Example:* If your RSI drops below 30 at 14:15, the signal is generated. The engine will not fill your order at the 14:15 Close. It will fill it at the 14:30 Open, simulating real-world latency and preventing impossible executions.
+
+## Disclaimer
+**This software is for educational and quantitative research purposes only.**
+It does not constitute financial advice. The models and testing frameworks provided are designed to validate statistical robustness, but past performance (even mathematically validated out-of-sample performance) is absolutely no guarantee of future returns. No profit guarantee is implied. Use at your own risk.
+
+## Institutional-Grade Accuracy Features
+This simulator goes beyond basic backtesting by implementing features standard in institutional quant desks:
+
+1. **Pessimistic Intra-Candle Resolution:** In traditional backtesters (like TradingView), if a single candle's wick hits both your Take Profit and your Stop Loss, the engine often assumes the TP was hit first (yielding fake profits). This engine employs *Pessimistic Resolution*: if both are breached within the same candle, it **always** assumes the Stop Loss was hit first.
+2. **Dynamic Slippage Modeling:** Not all executions are perfect. Limit orders (like Take Profit) get filled exactly. But Market orders (Entries, Stop Losses, Signal Reversals) are subjected to a configurable `slippage_rate` (default 0.05%) to accurately reflect order-book liquidity consumption.
