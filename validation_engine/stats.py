@@ -23,9 +23,10 @@ def calculate_metrics(trades):
 def calculate_confidence_interval(trades, n_iterations=1000, ci_level=95):
     """
     Calculates the lower bound of the Confidence Interval for the Profit Factor using Bootstrap resampling.
+    NOTE: Currently uses random sampling (IID assumption). Block-bootstrapping planned for Phase 3 to account for serial correlation.
     """
     if len(trades) < 5:
-        return 0.0  # Not enough data for statistical significance
+        return 0.0  
         
     returns = np.array([t['net_return'] for t in trades])
     simulated_pfs = []
@@ -48,14 +49,24 @@ def calculate_confidence_interval(trades, n_iterations=1000, ci_level=95):
     lower_percentile = (100 - ci_level) / 2
     return np.percentile(simulated_pfs, lower_percentile)
 
-def check_robustness(trades, remove_top_n=2):
+def check_robustness(trades, remove_top_pct=0.05):
     """
-    Removes the top N most profitable trades to ensure the strategy's edge is not
-    dependent on a few lucky outliers.
+    Profit Concentration Analysis (Claude Audit Fix).
+    Removes the top X% most profitable trades instead of a fixed number,
+    making the robustness check sample-size agnostic.
     """
-    if len(trades) <= remove_top_n:
+    if not trades:
+        return calculate_metrics([])
+        
+    n_to_remove = int(len(trades) * remove_top_pct)
+    
+    # Ensure we remove at least 1 trade if the sample size is small but meaningful (>10 trades)
+    if n_to_remove == 0 and len(trades) >= 10:
+        n_to_remove = 1
+        
+    if len(trades) <= n_to_remove:
         return calculate_metrics([])
         
     sorted_trades = sorted(trades, key=lambda x: x['net_return'], reverse=True)
-    robust_trades = sorted_trades[remove_top_n:]
+    robust_trades = sorted_trades[n_to_remove:]
     return calculate_metrics(robust_trades)

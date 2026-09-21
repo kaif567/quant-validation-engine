@@ -1,21 +1,41 @@
+import subprocess
 from .walk_forward import walk_forward_test
 from .stats import calculate_metrics, calculate_confidence_interval, check_robustness
 
-def multi_window_protocol(strategy_function, param_grid, data_dict):
+def get_git_revision_hash() -> str:
+    """Gets the current git commit hash for the audit trail."""
+    try:
+        return subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD']).decode('ascii').strip()
+    except Exception:
+        return "UNKNOWN_COMMIT"
+
+def multi_window_protocol(strategy_function, param_grid, data_dict, purge_bars=50, remove_top_pct=0.05):
     """
     Evaluates the strategy strictly across multiple provided datasets (coins/windows).
+    Generates a cryptographically auditable report structure.
     """
-    results = {}
+    git_hash = get_git_revision_hash()
+    
+    results = {
+        "_audit_trail": {
+            "engine_version_hash": git_hash,
+            "purge_bars_applied": purge_bars,
+            "robustness_pct_removed": remove_top_pct
+        },
+        "windows": {}
+    }
     
     for name, df in data_dict.items():
-        print(f"Running Walk-Forward Protocol for: {name}...")
-        oos_trades = walk_forward_test(strategy_function, param_grid, df)
+        print(f"Running Walk-Forward Protocol for: {name} (Purging {purge_bars} bars)...")
+        oos_trades = walk_forward_test(strategy_function, param_grid, df, purge_bars=purge_bars)
         
         metrics = calculate_metrics(oos_trades)
         ci_lower = calculate_confidence_interval(oos_trades)
-        robust_metrics = check_robustness(oos_trades, remove_top_n=2)
         
-        results[name] = {
+        # Claude Audit Fix: Percentage-based robustness
+        robust_metrics = check_robustness(oos_trades, remove_top_pct=remove_top_pct)
+        
+        results["windows"][name] = {
             'total_trades': metrics['total_trades'],
             'oos_profit_factor': metrics['profit_factor'],
             'ci_lower_bound': ci_lower,
