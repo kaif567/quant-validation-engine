@@ -1,5 +1,7 @@
 import pandas as pd
 import numpy as np
+import math
+from validation_engine.trial_ledger import normalize_payload, _build_liquidity_diag_normalized
 
 def simulate_trades(
     df_with_signals, 
@@ -317,24 +319,29 @@ def simulate_trades(
                     elif action == 'RESIZE':
                         approved_notional = capacity_cap
                         
-            diag_obj = {
-                "timeframe_implied_bars_per_day": bars_per_day,
-                "required_lookback_bars": 30 * bars_per_day if tiering_enabled else bars_per_day,
-                "prior_30d_avg_daily_quote_volume": p_30d,
-                "prior_24h_quote_volume": p_24h,
-                "prior_intrabar_range_fraction": float(current_row.get('prior_intrabar_range_fraction', 0.0)),
-                "requested_reference_notional": req_ref_notional,
-                "requested_execution_notional": req_exec_notional,
-                "estimated_causal_fill_price": est_fill_px,
-                "maximum_notional": capacity_cap,
-                "approved_notional": approved_notional,
-                "participation_rate_cap": liquidity_config.get('capacity', {}).get('participation_rate_cap', 0.05) if capacity_enabled else None,
-                "liquidity_tier_factor": tier_factor,
-                "capacity_action": "REJECT" if rejected else liquidity_config.get('capacity', {}).get('action', 'ACCEPT'),
-                "missing_data_policy_applied": applied_policy,
-                "signal_bar_time": str(current_row.name),
-                "execution_bar_time": str(next_row.name)
-            }
+            diag_obj = _build_liquidity_diag_normalized(
+                bars_per_day=bars_per_day,
+                required_lookback_bars=30 * bars_per_day if tiering_enabled else bars_per_day,
+                p_30d=p_30d,
+                p_24h=p_24h,
+                prior_intrabar_range_fraction=float(current_row.get('prior_intrabar_range_fraction', 0.0)),
+                req_ref_notional=req_ref_notional,
+                req_exec_notional=req_exec_notional,
+                est_fill_px=est_fill_px,
+                capacity_cap=capacity_cap,
+                approved_notional=approved_notional,
+                participation_rate_cap=liquidity_config.get('capacity', {}).get('participation_rate_cap', 0.05) if capacity_enabled else None,
+                tier_factor=tier_factor,
+                capacity_action="REJECT" if rejected else liquidity_config.get('capacity', {}).get('action', 'ACCEPT'),
+                missing_data_policy_applied=applied_policy,
+                signal_bar_time=current_row.name,
+                execution_bar_time=next_row.name,
+                tiering_enabled=tiering_enabled,
+                capacity_enabled=capacity_enabled,
+                missing_tier=missing_tier,
+                missing_cap=missing_cap,
+                reject_reason=reject_reason,
+            )
             
             if rejected:
                 rejected_events.append({
