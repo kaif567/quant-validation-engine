@@ -173,6 +173,8 @@ class TrialLedgerV2:
         self.last_hash = "0000000000000000000000000000000000000000000000000000000000000000"
         self.last_seq = 0
         self.schema_version = "2.1"
+        self.orphan_status_events = []
+        self._planned_trial_keys = set()
         self._load_chain_state()
 
     def _load_chain_state(self):
@@ -189,6 +191,21 @@ class TrialLedgerV2:
                         self.last_hash = record['event_hash']
                         self.last_seq = record['event_sequence']
                         self.current_campaign_id = record.get('research_campaign_id')
+                    if record.get('event_type') == 'candidate_fold_evaluation':
+                        payload = record.get('payload', {})
+                        ident = payload.get('identity', {})
+                        key = (
+                            record.get('run_id'),
+                            ident.get('strategy_family'),
+                            ident.get('universe_hash'),
+                            ident.get('param_hash'),
+                            payload.get('fold_id')
+                        )
+                        if str(payload.get('status', '')).lower() == 'planned':
+                            self._planned_trial_keys.add(key)
+                        else:
+                            if key not in self._planned_trial_keys:
+                                self.orphan_status_events.append(payload)
                 except json.JSONDecodeError:
                     pass
 
@@ -227,6 +244,7 @@ class TrialLedgerV2:
 
         self.last_hash = event_hash
         return record
+
 
     def record_resize_event(
         self,
@@ -319,6 +337,21 @@ class TrialLedgerV2:
         if not hasattr(self, '_run_candidates'):
             self._run_candidates = {}
         self._run_candidates[candidate_id] = payload
+
+        status_str = str(payload.get('status', '')).lower()
+        trial_key = (
+            self.current_run_id,
+            identity.get('strategy_family'),
+            identity.get('universe_hash'),
+            identity.get('param_hash'),
+            evaluation_data.get('fold_id')
+        )
+        if status_str == 'planned':
+            self._planned_trial_keys.add(trial_key)
+        else:
+            if trial_key not in self._planned_trial_keys:
+                self.orphan_status_events.append(payload)
+
         return self._append_event("candidate_fold_evaluation", payload)
         
     def record_event(self, event_type, payload):
@@ -493,3 +526,91 @@ class TrialLedgerV2:
                 "hash_chain_valid": True
             }
         }
+
+    def n_trials(self, run_id: str) -> int:
+        if not os.path.exists(self.path):
+            return 0
+        planned_keys = set()
+        with open(self.path, 'r') as f:
+            for line in f:
+                event = json.loads(line)
+                if (run_id is None or event.get('run_id') == run_id) and event.get('event_type') == 'candidate_fold_evaluation':
+                    payload = event.get('payload', {})
+                    if str(payload.get('status', '')).lower() == 'planned':
+                        identity = payload.get('identity', {})
+                        key = (
+                            event.get('run_id'),
+                            identity.get('strategy_family'),
+                            identity.get('universe_hash'),
+                            identity.get('param_hash'),
+                            payload.get('fold_id')
+                        )
+                        planned_keys.add(key)
+        return len(planned_keys)
+
+    def trial_rows(self, run_id: str) -> list[dict]:
+        if not os.path.exists(self.path):
+            return []
+        
+        ordered_trials = []
+        status_updates = {}
+        planned_keys = set()
+        
+        with open(self.path, 'r') as f:
+            for line in f:
+                event = json.loads(line)
+                if (run_id is None or event.get('run_id') == run_id) and event.get('event_type') == 'candidate_fold_evaluation':
+                    payload = event.get('payload', {})
+                    identity = payload.get('identity', {})
+                    key = (
+                        event.get('run_id'),
+                        identity.get('strategy_family'),
+                        identity.get('universe_hash'),
+                        identity.get('param_hash'),
+                        payload.get('fold_id')
+                    )
+                    status_val = str(payload.get('status', '')).lower()
+                    
+                    if status_val == 'planned':
+                        if key not in planned_keys:
+                            planned_keys.add(key)
+                            ordered_trials.append((key, event))
+                            status_updates[key] = {}
+                    else:
+                        if key in planned_keys:
+                            for k, v in payload.items():
+                                if k not in ['identity', 'fold_id']:
+                                    status_updates[key][k] = v
+                            status_updates[key]['ts_utc'] = event.get('ts_utc')
+                        else:
+                            # Orphan status event: never planned, do not create a planned trial
+                            if event not in self.orphan_status_events:
+                                self.orphan_status_events.append(event)
+                            
+        # Join original immutable plan with latest status
+        results = []
+        for key, original_event in ordered_trials:
+            plan_payload = original_event.get('payload', {})
+            plan_identity = plan_payload.get('identity', {})
+            # Construct the new structured record with immutable planned data and latest status
+            structured_record = {
+                "planned_trial": {
+                    "identity": {
+                        "run_id": original_event.get('run_id'),
+                        "strategy_family": plan_identity.get('strategy_family'),
+                        "universe_hash": plan_identity.get('universe_hash'),
+                        "param_hash": plan_identity.get('param_hash'),
+                        "fold_id": plan_payload.get('fold_id'),
+                    },
+                    "created_at_utc": original_event.get('ts_utc'),
+                    "status": "PLANNED",  # immutable — never changes
+                },
+                "latest_status": {
+                    "status": status_updates[key].get('status', 'PLANNED').upper(),
+                    "updated_at_utc": status_updates[key].get('ts_utc'),
+                    "reason": status_updates[key].get('reason', None),
+                },
+            }
+            results.append(structured_record)
+            
+        return results

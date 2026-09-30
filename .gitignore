@@ -4,6 +4,32 @@ __pycache__/
 *.so
 .env
 venv/
-*.csv
-*.parquet
 .DS_Store
+
+# Datasets
+data/*.csv
+data/*.parquet
+
+# Generated Outputs
+e2e_pid.txt
+hash_*.txt
+*.jsonl
+results_*.json
+e2e_results.json
+baseline_manifest.json
+
+# Temp debug scripts
+patch_*.py
+fix_*.py
+restore_sim*.py
+clean_patch.py
+re_apply.py
+wait_and_check.sh
+check_max_hold.py
+generate_manifest.py
+test_c.py
+test_debug.py
+scripts/debug_*.py
+scripts/wf_temp.py
+scripts/download_btc.py
+build_test_95.py
