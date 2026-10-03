@@ -17,6 +17,7 @@ class LegacyWalkForwardResult(TypedDict):
     trade_records: list[dict]
     raw_trial_ledger_ref: Optional[str]
     failed_gates: list[str]
+    pending_gates: Optional[list[str]]
     bootstrap: Optional[Any]
     top5_share: Optional[Any]
 
@@ -105,12 +106,69 @@ def validate_legacy_walk_forward_result(result: dict) -> None:
             f"!= portfolio_gates['overall_pass']={pg['overall_pass']}"
         )
 
+
+# Gate status categories (reference_design/multi_asset_orchestrator.py L47-56, L309-350):
+#   PASS: gate evaluated, requirement met
+#   FAIL: gate evaluated, requirement NOT met
+#   NOT_EVALUATED_PENDING_LEGACY_ADAPTER: gate not yet computed (no adapter exists)
+#   INSUFFICIENT_TRADES: cannot evaluate — not enough trades
+#   NO_PROFITABLE_TRADES: G5-specific — no winners to measure concentration
+#   NOT_APPLICABLE_*: gate does not apply (e.g. no losses for G5b)
+#
+# G1_G3_MEAN_RETURN: single gate covering mean_net_return > 0.
+#   In reference_design, G1 is fold-level mean_ret > 0, G2 is median(fold_G1) > 0,
+#   G3 is full-replay cost-resilience (separate from G4). In legacy single-asset
+#   mode all three derive from the same mean_net_return < 0 check, so we honestly
+#   collapse them into one gate. See reference_design/multi_asset_orchestrator.py L48-55.
+#
+# evaluation_equity_complete: True iff no trade has net_return=None (unresolved terminal).
+#   Reference: reference_design/multi_asset_orchestrator.py L112, L273, L317.
+
+GATE_STATUS_BACKDOOR_KWARGS = frozenset({'g5b_status', 'g6_status', 'g1_status', 'g2_status', 'g3_status', 'g4_status', 'g5_status'})
+
+def aggregate_gate_statuses(gate_status_map: dict) -> tuple:
+    """
+    Pure function: given a dict mapping gate_name -> status_string,
+    returns (overall_pass, failed_gates, pending_gates).
+    
+    Rules:
+      - PASS or NOT_APPLICABLE_* → gate satisfied
+      - FAIL, NO_PROFITABLE_TRADES → gate failed
+      - NOT_EVALUATED_*, INSUFFICIENT_TRADES, or any status containing 'PENDING' → pending
+      - overall_pass = True ONLY when failed_gates == [] AND pending_gates == []
+    """
+    pending_gates = []
+    failed_gates = []
+
+    for g_name in sorted(gate_status_map.keys()):
+        status = gate_status_map[g_name]
+        if status == 'PASS' or status.startswith('NOT_APPLICABLE'):
+            continue
+        elif (status.startswith('NOT_EVALUATED')
+              or status == 'INSUFFICIENT_TRADES'
+              or 'PENDING' in status):
+            pending_gates.append(g_name)
+        else:
+            # FAIL, NO_PROFITABLE_TRADES, or any unknown status → treat as failure
+            failed_gates.append(g_name)
+
+    overall_pass = (len(failed_gates) == 0 and len(pending_gates) == 0)
+    return overall_pass, failed_gates, pending_gates
+
+
 def walk_forward_test(
     strategy_function: Callable,
     param_grid: Dict[str, list],
     df: pd.DataFrame,
     **kwargs
 ) -> LegacyWalkForwardResult:
+    # Reject gate-status backdoor kwargs
+    backdoor_found = GATE_STATUS_BACKDOOR_KWARGS & set(kwargs.keys())
+    if backdoor_found:
+        raise TypeError(
+            f"walk_forward_test does not accept gate-status overrides: {backdoor_found}. "
+            f"Gate statuses are computed internally, never injected by the caller."
+        )
     
     initial_train_window = kwargs.get('initial_train_window', kwargs.get('train_window', 400))
     test_window = kwargs.get('test_window', 100)
@@ -229,15 +287,23 @@ def walk_forward_test(
         ledger.finish_run()
         
     baseline_failed_gates = []
-    failed_gates = []
-    overall_pass = True
     
+    # G1_G3_MEAN_RETURN: collapsed gate for legacy single-asset mode.
+    # In reference_design/multi_asset_orchestrator.py L48-55:
+    #   G1 = fold-level mean_ret > min_fold_return
+    #   G2 = median(fold_G1_returns) > 0
+    #   G3 = NOT_EVALUATED_PENDING_PORTFOLIO_GATE_ADAPTER (full replay resilience)
+    # All three reduce to mean_net_return < 0 in single-asset mode, so we
+    # honestly collapse them into one gate rather than pretend we have three.
     if all_oos_trades:
         net = calculate_metrics(all_oos_trades).get('mean_net_return', 0)
         if net < 0:
-            baseline_failed_gates.extend(['G1', 'G2', 'G3'])
-            failed_gates.extend(['G1', 'G2', 'G3'])
-            overall_pass = False
+            g1_g3_status = 'FAIL'
+            baseline_failed_gates.append('G1_G3_MEAN_RETURN')
+        else:
+            g1_g3_status = 'PASS'
+    else:
+        g1_g3_status = 'INSUFFICIENT_TRADES'
     
     # G4 Cost Shock Replay
     if all_oos_trades:
@@ -267,8 +333,11 @@ def walk_forward_test(
             
         g4_metrics = calculate_metrics(all_shock_trades)
         if g4_metrics.get('profit_factor', 0) < 1.0 or g4_metrics.get('net_profit', 0) < 0:
-            failed_gates.append('G4')
-            overall_pass = False
+            g4_status = 'FAIL'
+        else:
+            g4_status = 'PASS'
+    else:
+        g4_status = 'INSUFFICIENT_TRADES'
 
     # G5 Concentration — Decimal official completed-trade PnL
     # Uses actual entry/exit fill prices, fees, and quantity (NOT net_return shortcut)
@@ -316,25 +385,40 @@ def walk_forward_test(
         if g5_top5_share > max_share:
             g5_status = 'FAIL'
             baseline_failed_gates.append('G5')
-            failed_gates.append('G5')
         else:
             g5_status = 'PASS'
 
-    if len(all_oos_trades) == 0:
-        overall_pass = False
-        if 'G4' not in failed_gates:
-            failed_gates.append('G4')
+    # G5b and G6 — NOT computed in legacy single-asset mode. No adapter exists.
+    g5b_status = 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER'
+    g6_status = 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER'
 
-    if failed_gates:
-        overall_pass = False
+    gate_status_map = {
+        'G1_G3_MEAN_RETURN': g1_g3_status,
+        'G4': g4_status,
+        'G5': g5_status,
+        'G5b': g5b_status,
+        'G6': g6_status,
+    }
+
+    # Use the pure aggregation function
+    overall_pass, failed_gates, pending_gates = aggregate_gate_statuses(gate_status_map)
+    institutional_pass_eligible = overall_pass
+
+    # evaluation_equity_complete: True iff every trade has a resolved net_return.
+    # (reference_design/multi_asset_orchestrator.py L112, L273)
+    evaluation_equity_complete = all(
+        t.get('net_return') is not None for t in all_oos_trades
+    ) if all_oos_trades else True  # No trades = vacuously complete
 
     portfolio_gates = {
         'overall_pass': overall_pass,
         'failed_gates': failed_gates,
+        'pending_gates': pending_gates,
         'baseline_failed_gates': baseline_failed_gates,
-        'institutional_pass_eligible': overall_pass,
-        'evaluation_equity_complete': True,
-        'G4': 'PASS' if 'G4' not in failed_gates and all_oos_trades else 'FAIL',
+        'institutional_pass_eligible': institutional_pass_eligible,
+        'evaluation_equity_complete': evaluation_equity_complete,
+        'G1_G3_MEAN_RETURN': g1_g3_status,
+        'G4': g4_status,
         'G5': g5_status,
         'g5_status': g5_status,
         'completed_trade_count': g5_completed_trade_count,
@@ -343,10 +427,10 @@ def walk_forward_test(
         'top_profit': g5_top_profit,
         'total_positive_profit': g5_total_positive_profit,
         'top5_share': g5_top5_share,
-        'G5b': 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER',
-        'g5b_status': 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER',
-        'G6': 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER',
-        'g6_status': 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER',
+        'G5b': g5b_status,
+        'g5b_status': g5b_status,
+        'G6': g6_status,
+        'g6_status': g6_status,
         'bootstrap': None,
     }
 
@@ -357,6 +441,7 @@ def walk_forward_test(
         'folds': fold_results,
         'portfolio_gates': portfolio_gates,
         'failed_gates': failed_gates,
+        'pending_gates': pending_gates,
         'overall_pass': overall_pass,
         'trade_records': all_oos_trades,
         'raw_trial_ledger_ref': run_id,

@@ -2,7 +2,7 @@ import unittest
 import pandas as pd
 import numpy as np
 import re
-from validation_engine.walk_forward import walk_forward_test
+from validation_engine.walk_forward import walk_forward_test, aggregate_gate_statuses
 from validation_engine.stats import block_bootstrap
 
 class TestValidationGates(unittest.TestCase):
@@ -28,12 +28,24 @@ class TestValidationGates(unittest.TestCase):
         res = walk_forward_test(strategy, {'p': [1, 2]}, df, train_window=50, test_window=50, step=50, purge_bars=0, embargo_bars=0, fee_rate=0.0, entry_slippage=0.0, stop_slippage=0.0, min_trades_for_g5=0)
         
         self.assertFalse(res['portfolio_gates']['overall_pass'])
-        self.assertIn('G1', res['portfolio_gates']['failed_gates'])
-        self.assertIn('G2', res['portfolio_gates']['failed_gates'])
-        self.assertIn('G3', res['portfolio_gates']['failed_gates'])
-        # If no winning trades, G5 is 1.0 (skipped/failed).
+        self.assertIn('G1_G3_MEAN_RETURN', res['portfolio_gates']['failed_gates'])
 
-    def test_c2_all_positive_pass(self):
+    def test_aggregate_gate_statuses_all_pass(self):
+        """Pure aggregation function: all gates PASS -> overall_pass True, no failed or pending gates"""
+        status_map = {
+            'G1_G3_MEAN_RETURN': 'PASS',
+            'G4': 'PASS',
+            'G5': 'PASS',
+            'G5b': 'PASS',
+            'G6': 'PASS',
+        }
+        overall_pass, failed_gates, pending_gates = aggregate_gate_statuses(status_map)
+        self.assertTrue(overall_pass)
+        self.assertEqual(failed_gates, [])
+        self.assertEqual(pending_gates, [])
+
+    def test_c2_all_positive_walk_forward_has_pending_gates(self):
+        """In real walk_forward_test, positive trades pass G1_G3, G4, G5, but uncomputed G5b/G6 remain pending so overall_pass is False"""
         df = pd.DataFrame({'open': [100.0]*200, 'high': [105.0]*200, 'low': [95.0]*200, 'close': [100.0]*200})
         
         def strategy(df, p):
@@ -48,7 +60,48 @@ class TestValidationGates(unittest.TestCase):
             df.loc[i+3, 'open'] = 110.0 
             
         res = walk_forward_test(strategy, {'p': [1, 2]}, df, train_window=100, test_window=100, step=100, purge_bars=0, embargo_bars=0, max_top5_share=0.9, min_trades_for_g5=0, entry_slippage=0.0, stop_slippage=0.0)
-        self.assertTrue(res['portfolio_gates']['overall_pass'], msg=f"Failed gates: {res['portfolio_gates']['failed_gates']}")
+        pg = res['portfolio_gates']
+        self.assertEqual(pg['failed_gates'], [])
+        self.assertEqual(pg['G1_G3_MEAN_RETURN'], 'PASS')
+        self.assertEqual(pg['G4'], 'PASS')
+        self.assertEqual(pg['G5'], 'PASS')
+        self.assertEqual(pg['G5b'], 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER')
+        self.assertEqual(pg['G6'], 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER')
+        self.assertIn('G5b', pg['pending_gates'])
+        self.assertIn('G6', pg['pending_gates'])
+        self.assertFalse(pg['overall_pass'])
+        self.assertFalse(pg['institutional_pass_eligible'])
+
+    def test_g6_not_evaluated_blocks_pass(self):
+        """G6 NOT_EVALUATED -> overall_pass False, institutional_pass_eligible False, pending_gates contains 'G6'"""
+        df = pd.DataFrame({'open': [100.0]*200, 'high': [105.0]*200, 'low': [95.0]*200, 'close': [100.0]*200})
+        def strategy(df, p):
+            df['signal'] = 0
+            for i in range(10, len(df)-5, 10):
+                df.loc[df.index[i], 'signal'] = 1
+                df.loc[df.index[i+2], 'signal'] = -1
+            return df
+        for i in range(10, 200-5, 10):
+            df.loc[i+1, 'open'] = 100.0
+            df.loc[i+3, 'open'] = 110.0
+        res = walk_forward_test(strategy, {'p': [1, 2]}, df, train_window=100, test_window=100, step=100, purge_bars=0, embargo_bars=0, max_top5_share=0.9, min_trades_for_g5=0, entry_slippage=0.0, stop_slippage=0.0)
+        pg = res['portfolio_gates']
+        self.assertFalse(res['overall_pass'])
+        self.assertFalse(pg['overall_pass'])
+        self.assertFalse(pg['institutional_pass_eligible'])
+        self.assertIn('G6', pg['pending_gates'])
+        self.assertEqual(pg['G6'], 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER')
+
+    def test_backdoor_gate_status_injection_raises_type_error(self):
+        """Calling walk_forward_test with g6_status or other gate status kwargs raises TypeError"""
+        df = pd.DataFrame({'open': [100.0]*100, 'high': [105.0]*100, 'low': [95.0]*100, 'close': [100.0]*100})
+        def strategy(df, p):
+            df['signal'] = 0
+            return df
+        with self.assertRaisesRegex(TypeError, "walk_forward_test does not accept gate-status overrides"):
+            walk_forward_test(strategy, {'p': [1]}, df, g6_status='PASS')
+        with self.assertRaisesRegex(TypeError, "walk_forward_test does not accept gate-status overrides"):
+            walk_forward_test(strategy, {'p': [1]}, df, g5b_status='PASS')
 
     def test_c3_cost_shock_fails_g4(self):
         df = pd.DataFrame({'open': [100.0]*200, 'high': [105.0]*200, 'low': [95.0]*200, 'close': [100.0]*200})
@@ -69,6 +122,56 @@ class TestValidationGates(unittest.TestCase):
         self.assertEqual(res['portfolio_gates']['baseline_failed_gates'], [])
         self.assertEqual(res['portfolio_gates']['failed_gates'], ['G4'])
         self.assertFalse(res['portfolio_gates']['overall_pass']) 
+    def test_g4_cost_inputs_end_to_end(self):
+        """
+        Captures simulator arguments for baseline and G4 shocked replay,
+        asserting exact 2x doubling of fee_rate, entry_slippage, and stop_slippage.
+        """
+        from unittest.mock import patch
+        from decimal import Decimal
+        import validation_engine.walk_forward as wf_mod
+
+        df = pd.DataFrame({'open': [100.0]*200, 'high': [105.0]*200, 'low': [95.0]*200, 'close': [100.0]*200, 'atr': [1.0]*200})
+        def strategy(df, p):
+            df['signal'] = 0
+            for i in range(10, len(df)-5, 10):
+                df.loc[df.index[i], 'signal'] = 1
+                df.loc[df.index[i+2], 'signal'] = -1
+            return df
+
+        captured_calls = []
+        orig_simulate = wf_mod.simulate_trades
+
+        def intercept_simulate(sim_df, **sim_kwargs):
+            captured_calls.append(sim_kwargs.copy())
+            return orig_simulate(sim_df, **sim_kwargs)
+
+        with patch.object(wf_mod, 'simulate_trades', side_effect=intercept_simulate):
+            wf_mod.walk_forward_test(
+                strategy,
+                {'p': [1]},
+                df,
+                train_window=50,
+                test_window=50,
+                step=50,
+                fee_rate=0.001,
+                entry_slippage=0.0005,
+                stop_slippage=0.0005,
+                min_trades_for_g5=0
+            )
+
+        baseline_call = [c for c in captured_calls if c.get('fee_rate') == 0.001][0]
+        shocked_call = [c for c in captured_calls if c.get('fee_rate') == 0.002][0]
+
+        # Assert baseline cost inputs
+        self.assertEqual(Decimal(str(baseline_call['fee_rate'])), Decimal("0.001"))
+        self.assertEqual(Decimal(str(baseline_call['entry_slippage'])), Decimal("0.0005"))
+        self.assertEqual(Decimal(str(baseline_call['stop_slippage'])), Decimal("0.0005"))
+
+        # Assert G4 shocked replay cost inputs (exact 2x)
+        self.assertEqual(Decimal(str(shocked_call['fee_rate'])), Decimal("0.002"))
+        self.assertEqual(Decimal(str(shocked_call['entry_slippage'])), Decimal("0.0010"))
+        self.assertEqual(Decimal(str(shocked_call['stop_slippage'])), Decimal("0.0010"))
 
     def test_c4_concentration_only_fails_g5(self):
         df = pd.DataFrame({'open': [100.0]*200, 'high': [105.0]*200, 'low': [95.0]*200, 'close': [100.0]*200})
