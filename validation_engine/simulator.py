@@ -1,7 +1,197 @@
 import pandas as pd
 import numpy as np
 import math
+from decimal import Decimal, ROUND_HALF_UP
 from validation_engine.trial_ledger import normalize_payload, _build_liquidity_diag_normalized
+
+MONEY_Q = Decimal("0.00000001")
+RETURN_Q = Decimal("0.000000000000000001")
+
+
+class ShadowCapitalLedgerTracker:
+    def __init__(self, shadow_ledger_config=None, configured_quantity=1.0):
+        config = shadow_ledger_config or {}
+        embargo_close_price = config.get('embargo_close_price')
+        qty = config.get('configured_quantity', configured_quantity)
+        margin = config.get('fee_coverage_margin', Decimal("0.005"))
+
+        self.valid = True
+        self.invalid_reason = None
+        self.e_initial = None
+        self.shadow_cash = None
+        self.shadow_qty = Decimal("0")
+        self.shadow_direction = 'cash'
+        self.bar_equities = []
+        self.bar_returns = []
+        self.bar_timestamps = []
+        self.trade_count = 0
+
+        self.embargo_close_price = None
+        self.embargo_close_timestamp = config.get('embargo_close_timestamp')
+        self.configured_qty = None
+        self.fee_coverage_margin = margin
+        self.effective_fee_rate = config.get('fee_rate')
+        self.effective_entry_slippage = config.get('entry_slippage')
+        self.effective_stop_slippage = config.get('stop_slippage')
+
+        if embargo_close_price is None or qty is None or margin is None:
+            self.valid = False
+            self.invalid_reason = 'INVALID_CAPITAL_INPUT_MISSING_OR_NONPOSITIVE'
+            return
+
+        if isinstance(embargo_close_price, float) and (math.isnan(embargo_close_price) or math.isinf(embargo_close_price)):
+            self.valid = False
+            self.invalid_reason = 'INVALID_CAPITAL_INPUT_MISSING_OR_NONPOSITIVE'
+            return
+
+        if isinstance(qty, float) and (math.isnan(qty) or math.isinf(qty)):
+            self.valid = False
+            self.invalid_reason = 'INVALID_CAPITAL_INPUT_MISSING_OR_NONPOSITIVE'
+            return
+
+        try:
+            p_close = Decimal(str(embargo_close_price))
+            q_val = Decimal(str(qty))
+            m_val = Decimal(str(margin))
+            if (
+                p_close.is_nan() or p_close.is_infinite() or p_close <= Decimal("0") or
+                q_val.is_nan() or q_val.is_infinite() or q_val <= Decimal("0") or
+                m_val.is_nan() or m_val.is_infinite() or m_val < Decimal("0")
+            ):
+                self.valid = False
+                self.invalid_reason = 'INVALID_CAPITAL_INPUT_MISSING_OR_NONPOSITIVE'
+                return
+            self.embargo_close_price = p_close
+            self.configured_qty = q_val
+            self.e_initial = p_close * q_val * (Decimal("1") + m_val)
+            self.shadow_cash = self.e_initial
+        except Exception:
+            self.valid = False
+            self.invalid_reason = 'INVALID_CAPITAL_INPUT_MISSING_OR_NONPOSITIVE'
+
+    def record_entry(self, fill_price: Decimal, quantity: Decimal, fee: Decimal, direction: str):
+        if not self.valid:
+            return
+        if direction.lower() != 'long':
+            self.valid = False
+            self.invalid_reason = 'INVALID_UNSUPPORTED_SHORT_DIRECTION'
+            return
+        notional = fill_price * quantity
+        self.shadow_cash -= (notional + fee)
+        if self.shadow_cash < Decimal("0"):
+            self.valid = False
+            self.invalid_reason = 'INVALID_SHADOW_CASH_DEPLETED'
+        self.shadow_qty = quantity
+        self.shadow_direction = 'long'
+        self.trade_count += 1
+
+    def record_exit(self, fill_price: Decimal, quantity: Decimal, fee: Decimal, direction: str):
+        if not self.valid:
+            return
+        if direction.lower() != 'long' or self.shadow_direction != 'long':
+            self.valid = False
+            self.invalid_reason = 'INVALID_UNSUPPORTED_SHORT_DIRECTION'
+            return
+        notional = fill_price * quantity
+        self.shadow_cash += (notional - fee)
+        if self.shadow_cash < Decimal("0"):
+            self.valid = False
+            self.invalid_reason = 'INVALID_SHADOW_CASH_DEPLETED'
+        self.shadow_qty = Decimal("0")
+        self.shadow_direction = 'cash'
+
+    def record_bar_close(self, close_price, timestamp=None):
+        ts_str = str(timestamp) if timestamp is not None else ""
+        if not self.valid:
+            self.bar_equities.append(Decimal("0"))
+            self.bar_returns.append(Decimal("0.0"))
+            self.bar_timestamps.append(ts_str)
+            return
+
+        if close_price is None or (isinstance(close_price, float) and (math.isnan(close_price) or math.isinf(close_price))):
+            self.valid = False
+            self.invalid_reason = 'INVALID_NONPOSITIVE_OR_NONFINITE_EQUITY'
+            self.bar_equities.append(Decimal("0"))
+            self.bar_returns.append(Decimal("0.0"))
+            self.bar_timestamps.append(ts_str)
+            return
+
+        try:
+            close_dec = Decimal(str(close_price))
+            if close_dec.is_nan() or close_dec.is_infinite() or close_dec <= Decimal("0"):
+                self.valid = False
+                self.invalid_reason = 'INVALID_NONPOSITIVE_OR_NONFINITE_EQUITY'
+                self.bar_equities.append(Decimal("0"))
+                self.bar_returns.append(Decimal("0.0"))
+                self.bar_timestamps.append(ts_str)
+                return
+        except Exception:
+            self.valid = False
+            self.invalid_reason = 'INVALID_NONPOSITIVE_OR_NONFINITE_EQUITY'
+            self.bar_equities.append(Decimal("0"))
+            self.bar_returns.append(Decimal("0.0"))
+            self.bar_timestamps.append(ts_str)
+            return
+
+        if self.shadow_direction == 'long':
+            mtm = self.shadow_cash + (self.shadow_qty * close_dec)
+        else:
+            mtm = self.shadow_cash
+
+        if mtm.is_nan() or mtm.is_infinite() or mtm <= Decimal("0"):
+            self.valid = False
+            self.invalid_reason = 'INVALID_NONPOSITIVE_OR_NONFINITE_EQUITY'
+            self.bar_equities.append(mtm if not (mtm.is_nan() or mtm.is_infinite()) else Decimal("0"))
+            self.bar_returns.append(Decimal("0.0"))
+            self.bar_timestamps.append(ts_str)
+            return
+
+        prev_e = self.e_initial if len(self.bar_equities) == 0 else self.bar_equities[-1]
+        if prev_e > Decimal("0"):
+            r_bar = ((mtm - prev_e) / prev_e).quantize(RETURN_Q, rounding=ROUND_HALF_UP)
+        else:
+            r_bar = Decimal("0.0")
+
+        self.bar_equities.append(mtm)
+        self.bar_returns.append(r_bar)
+        self.bar_timestamps.append(ts_str)
+
+    def get_report(self, official_trades: list) -> dict:
+        from validation_engine.walk_forward import official_completed_trade_pnl
+        official_pnl_sum = sum((official_completed_trade_pnl(t) for t in official_trades), Decimal("0"))
+        if self.valid and self.e_initial is not None and len(self.bar_equities) > 0:
+            final_equity = self.bar_equities[-1]
+            delta_cash = final_equity - self.e_initial
+            monetary_residual = abs(delta_cash - official_pnl_sum)
+        else:
+            final_equity = None
+            delta_cash = None
+            monetary_residual = None
+
+        return {
+            'model': 'OBSERVATION-ONLY SHADOW-CAPITAL LEDGER',
+            'status': 'VALID' if self.valid else self.invalid_reason,
+            'valid': self.valid,
+            'invalid_reason': self.invalid_reason,
+            'embargo_close_price': self.embargo_close_price,
+            'embargo_close_timestamp': self.embargo_close_timestamp,
+            'configured_quantity': self.configured_qty,
+            'fee_coverage_margin': self.fee_coverage_margin,
+            'effective_fee_rate': self.effective_fee_rate,
+            'effective_entry_slippage': self.effective_entry_slippage,
+            'effective_stop_slippage': self.effective_stop_slippage,
+            'e_initial': self.e_initial,
+            'e_final': final_equity,
+            'delta_shadow_cash': delta_cash,
+            'official_monetary_pnl': official_pnl_sum,
+            'monetary_reconciliation_residual': monetary_residual,
+            'bar_count': len(self.bar_returns),
+            'bar_equities': self.bar_equities,
+            'bar_returns': self.bar_returns,
+            'bar_timestamps': self.bar_timestamps,
+            'trade_count': self.trade_count,
+        }
+
 
 def simulate_trades(
     df_with_signals, 
@@ -15,9 +205,10 @@ def simulate_trades(
     liquidity_config=None,
     timeframe='1h',
     intended_quantity=1.0,
-    initial_cash=1000000000.0
+    initial_cash=1000000000.0,
+    track_shadow_ledger=False,
+    shadow_ledger_config=None
 ):
-    from decimal import Decimal
     entry_slippage = Decimal(str(entry_slippage))
     stop_slippage = Decimal(str(stop_slippage))
 
@@ -37,6 +228,13 @@ def simulate_trades(
     current_gross_exposure = Decimal("0")
     current_position_count = 0
     
+    shadow_tracker = None
+    if track_shadow_ledger:
+        shadow_tracker = ShadowCapitalLedgerTracker(
+            shadow_ledger_config=shadow_ledger_config,
+            configured_quantity=intended_quantity
+        )
+
     if liquidity_config is None:
         liquidity_config = {
             "liquidity_tiering_enabled": False,
@@ -278,6 +476,14 @@ def simulate_trades(
                 })
                 position = None
                 entry_fill_obj = None
+                if shadow_tracker:
+                    _exit_dir = 'long' if entry_current_position_direction.lower() == 'long' else 'short'
+                    shadow_tracker.record_exit(
+                        fill_price=Decimal(str(exit_price)),
+                        quantity=Decimal(str(intended_quantity)),
+                        fee=Decimal(str(exit_fee_amount)),
+                        direction=_exit_dir
+                    )
                 
         if position is None and signal in [1, -1]:
             req_px = float(next_row['open'])
@@ -501,6 +707,17 @@ def simulate_trades(
                     'liquidity_diagnostics': diag_obj
                 }
                 entry_current_position_direction = 'long' if signal == 1 else 'short'
+                if shadow_tracker:
+                    _entry_dir = 'long' if signal == 1 else 'short'
+                    shadow_tracker.record_entry(
+                        fill_price=_est_fill_px_dec,
+                        quantity=_approved_qty_dec,
+                        fee=_entry_fee_dec,
+                        direction=_entry_dir
+                    )
+
+        if shadow_tracker:
+            shadow_tracker.record_bar_close(current_row['close'], timestamp=current_row.name)
                 
     if position is not None:
         last_row = df.iloc[-1]
@@ -551,5 +768,20 @@ def simulate_trades(
             'entry_fill': entry_fill_obj,
             'exit_fill': exit_fill_obj
         })
+        if shadow_tracker:
+            _bndry_dir = 'long' if entry_current_position_direction.lower() == 'long' else 'short'
+            shadow_tracker.record_exit(
+                fill_price=Decimal(str(exit_price)),
+                quantity=Decimal(str(intended_quantity)),
+                fee=Decimal(str(bndry_exit_fee)),
+                direction=_bndry_dir
+            )
         
+    if shadow_tracker and len(df) > 0:
+        shadow_tracker.record_bar_close(df.iloc[-1]['close'], timestamp=df.iloc[-1].name)
+
+    if track_shadow_ledger:
+        shadow_report = shadow_tracker.get_report(trades) if shadow_tracker else None
+        return trades, rejected_events, decision_traces, shadow_report
+
     return trades, rejected_events, decision_traces

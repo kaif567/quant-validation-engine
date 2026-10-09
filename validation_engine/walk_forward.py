@@ -5,7 +5,7 @@ import math
 from decimal import Decimal, ROUND_HALF_UP, ROUND_CEILING
 from typing import Callable, Dict, Any, List, TypedDict, Optional
 from validation_engine.simulator import simulate_trades
-from validation_engine.stats import calculate_metrics
+from validation_engine.stats import calculate_metrics, run_g6_shadow_bootstrap_v2
 
 class LegacyWalkForwardResult(TypedDict):
     schema_version: str
@@ -190,6 +190,8 @@ def walk_forward_test(
     current_start = 0
     all_oos_trades = []
     fold_results = []
+    fold_shadow_reports = []
+    enable_shadow_g6 = kwargs.get('enable_shadow_g6', False)
     
     while current_start + initial_train_window + purge_bars + test_window <= total_len:
         train_df = df.iloc[current_start:current_start + initial_train_window]
@@ -277,7 +279,33 @@ def walk_forward_test(
             }
             sim_kwargs = {k: v for k, v in sim_kwargs.items() if v is not None}
             
-            oos_trades, _, _ = simulate_trades(sim_test, **sim_kwargs)
+            if enable_shadow_g6:
+                embargo_close_price = None
+                embargo_timestamp = None
+                if test_start > 0:
+                    embargo_bar = df.iloc[test_start - 1]
+                    embargo_close_price = float(embargo_bar['close'])
+                    embargo_timestamp = str(embargo_bar.name)
+                shadow_cfg = {
+                    'embargo_close_price': embargo_close_price,
+                    'embargo_timestamp': embargo_timestamp,
+                    'configured_quantity': kwargs.get('intended_quantity', 1.0),
+                    'fee_coverage_margin': kwargs.get('fee_coverage_margin', Decimal("0.005")),
+                    'fee_rate': sim_kwargs.get('fee_rate', fee_rate),
+                    'entry_slippage': sim_kwargs.get('entry_slippage', 0.0),
+                    'stop_slippage': sim_kwargs.get('stop_slippage', 0.0),
+                }
+                oos_trades, _, _, shadow_report = simulate_trades(
+                    sim_test,
+                    track_shadow_ledger=True,
+                    shadow_ledger_config=shadow_cfg,
+                    **sim_kwargs
+                )
+                if shadow_report:
+                    shadow_report['fold_id'] = len(fold_results)
+                fold_shadow_reports.append(shadow_report)
+            else:
+                oos_trades, _, _ = simulate_trades(sim_test, **sim_kwargs)
             all_oos_trades.extend(oos_trades)
             
         fold_results.append({'fold_id': len(fold_results), 'best_params': best_params, 'train_objective': best_pf})
@@ -416,8 +444,56 @@ def walk_forward_test(
             else:
                 g5b_status = 'FAIL'
 
-    # G6 — NOT computed in legacy single-asset mode. No adapter exists.
-    g6_status = 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER'
+    if enable_shadow_g6:
+        invalid_reports = [r for r in fold_shadow_reports if not r.get('valid', False)]
+        if invalid_reports:
+            g6_status = invalid_reports[0].get('invalid_reason', 'INVALID_SHADOW_CASH_DEPLETED')
+            g6_computational_metric = 'INVALID'
+            g6_q05 = None
+            g6_hash = None
+            g6_artifact = {
+                'schema_version': 'g6_shadow_bar_returns_v2',
+                'formula_version': 'v2',
+                'g6_status': g6_status,
+                'computational_metric': 'INVALID',
+                'invalid_reports': [r.get('invalid_reason') for r in invalid_reports]
+            }
+        elif not fold_shadow_reports or any(r.get('bar_count', 0) < kwargs.get('g6_block_length', 10) for r in fold_shadow_reports):
+            g6_status = 'INSUFFICIENT_TRADES'
+            g6_computational_metric = 'INSUFFICIENT'
+            g6_q05 = None
+            g6_hash = None
+            g6_artifact = {
+                'schema_version': 'g6_shadow_bar_returns_v2',
+                'formula_version': 'v2',
+                'g6_status': g6_status,
+                'g6_reason': 'BAR_SAMPLE_TOO_SHORT',
+                'computational_metric': 'INSUFFICIENT',
+            }
+        else:
+            cfg_meta = {
+                'normalization_multiplier': Decimal("1.005"),
+                'configured_quantity': kwargs.get('intended_quantity', 1.0),
+                'effective_fee_rate': fee_rate,
+                'effective_entry_slippage': kwargs.get('entry_slippage', 0.0),
+                'effective_stop_slippage': kwargs.get('stop_slippage', 0.0),
+            }
+            g6_artifact, g6_hash, g6_q05 = run_g6_shadow_bootstrap_v2(
+                fold_shadow_reports,
+                seed=kwargs.get('g6_seed', 42),
+                block_length=kwargs.get('g6_block_length', 10),
+                replicates=kwargs.get('g6_replicates', 1000),
+                configuration_metadata=cfg_meta
+            )
+            g6_status = g6_artifact['g6_status']
+            g6_computational_metric = g6_artifact['computational_metric']
+    else:
+        # G6 — NOT computed in legacy single-asset mode. No adapter exists.
+        g6_status = 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER'
+        g6_computational_metric = None
+        g6_q05 = None
+        g6_hash = None
+        g6_artifact = None
 
     gate_status_map = {
         'G1_G3_MEAN_RETURN': g1_g3_status,
@@ -465,7 +541,10 @@ def walk_forward_test(
         # G6 fields
         'G6': g6_status,
         'g6_status': g6_status,
-        'bootstrap': None,
+        'g6_computational_metric': g6_computational_metric,
+        'g6_q05': g6_q05,
+        'full_bootstrap_artifact_hash': g6_hash,
+        'bootstrap': g6_artifact,
     }
 
     result: LegacyWalkForwardResult = {
@@ -479,7 +558,7 @@ def walk_forward_test(
         'overall_pass': overall_pass,
         'trade_records': all_oos_trades,
         'raw_trial_ledger_ref': run_id,
-        'bootstrap': None,
+        'bootstrap': g6_artifact,
         'top5_share': None
     }
 
