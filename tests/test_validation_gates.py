@@ -2,7 +2,12 @@ import unittest
 import pandas as pd
 import numpy as np
 import re
-from validation_engine.walk_forward import walk_forward_test, aggregate_gate_statuses
+from decimal import Decimal
+from validation_engine.walk_forward import (
+    walk_forward_test,
+    aggregate_gate_statuses,
+    official_completed_trade_pnl,
+)
 from validation_engine.stats import block_bootstrap
 
 class TestValidationGates(unittest.TestCase):
@@ -45,7 +50,7 @@ class TestValidationGates(unittest.TestCase):
         self.assertEqual(pending_gates, [])
 
     def test_c2_all_positive_walk_forward_has_pending_gates(self):
-        """In real walk_forward_test, positive trades pass G1_G3, G4, G5, but uncomputed G5b/G6 remain pending so overall_pass is False"""
+        """In real walk_forward_test, positive trades pass G1_G3, G4, G5, G5b is NOT_APPLICABLE_NO_LOSSES (satisfied), but uncomputed G6 remains pending so overall_pass is False"""
         df = pd.DataFrame({'open': [100.0]*200, 'high': [105.0]*200, 'low': [95.0]*200, 'close': [100.0]*200})
         
         def strategy(df, p):
@@ -65,9 +70,9 @@ class TestValidationGates(unittest.TestCase):
         self.assertEqual(pg['G1_G3_MEAN_RETURN'], 'PASS')
         self.assertEqual(pg['G4'], 'PASS')
         self.assertEqual(pg['G5'], 'PASS')
-        self.assertEqual(pg['G5b'], 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER')
+        self.assertEqual(pg['G5b'], 'NOT_APPLICABLE_NO_LOSSES')
         self.assertEqual(pg['G6'], 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER')
-        self.assertIn('G5b', pg['pending_gates'])
+        self.assertNotIn('G5b', pg['pending_gates'])
         self.assertIn('G6', pg['pending_gates'])
         self.assertFalse(pg['overall_pass'])
         self.assertFalse(pg['institutional_pass_eligible'])
@@ -339,6 +344,243 @@ class TestValidationGates(unittest.TestCase):
         self.assertGreater(pg['top_count'], 0)
         self.assertGreater(pg['total_positive_profit'], Decimal("0"))
         self.assertEqual(pg['top_profit'], Decimal("17.8"))
+
+    # ── G5b Loss Stress Test Permanent Tests ─────────────────────────────────
+
+    def test_g5b_insufficient_sample(self):
+        """G5b: trade count below min_trades_for_g5b -> INSUFFICIENT_TRADES in pending_gates"""
+        df = pd.DataFrame({'open': [100.0]*100, 'high': [105.0]*100, 'low': [95.0]*100, 'close': [100.0]*100})
+        def strategy(df, p):
+            df['signal'] = 0
+            if df.index[-1] > 50:
+                df.iloc[-20, df.columns.get_loc('signal')] = 1
+                df.iloc[-10, df.columns.get_loc('signal')] = -1
+            return df
+        # Only 1 trade produced, default min_trades_for_g5b=10
+        res = walk_forward_test(strategy, {'p': [1]}, df, train_window=50, test_window=50, step=50,
+                                purge_bars=0, embargo_bars=0, min_trades_for_g5=0, min_trades_for_g5b=10,
+                                entry_slippage=0.0, stop_slippage=0.0)
+        pg = res['portfolio_gates']
+        self.assertEqual(pg['G5b'], 'INSUFFICIENT_TRADES')
+        self.assertEqual(pg['g5b_status'], 'INSUFFICIENT_TRADES')
+        self.assertIn('G5b', pg['pending_gates'])
+        self.assertIsNone(pg['g5b_global_pnl'])
+        self.assertIsNone(pg['g5b_largest_loss'])
+        self.assertIsNone(pg['g5b_stressed_pnl'])
+        self.assertEqual(pg['g5b_min_trades'], 10)
+
+    def test_g5b_nonpositive_global_pnl(self):
+        """G5b: global PnL <= 0 -> NOT_APPLICABLE_NONPOSITIVE_GLOBAL_PNL, satisfied (not pending/failed)"""
+        df = pd.DataFrame({'open': [100.0]*200, 'high': [105.0]*200, 'low': [95.0]*200, 'close': [100.0]*200})
+        def strategy(df, p):
+            df['signal'] = 0
+            # 2 trades in test window
+            df.loc[110, 'signal'] = 1
+            df.loc[120, 'signal'] = -2
+            df.loc[130, 'signal'] = 1
+            df.loc[140, 'signal'] = -2
+            return df
+        # trade 1: win (+5), trade 2: loss (-15) -> global PnL = -10 <= 0
+        df.loc[111, 'open'] = 100.0
+        df.loc[121, 'open'] = 105.0
+        df.loc[131, 'open'] = 100.0
+        df.loc[141, 'open'] = 85.0
+        res = walk_forward_test(strategy, {'p': [1]}, df, train_window=100, test_window=100, step=100,
+                                purge_bars=0, embargo_bars=0, fee_rate=0.0, min_trades_for_g5=0,
+                                min_trades_for_g5b=2, entry_slippage=0.0, stop_slippage=0.0)
+        pg = res['portfolio_gates']
+        self.assertEqual(pg['G5b'], 'NOT_APPLICABLE_NONPOSITIVE_GLOBAL_PNL')
+        self.assertEqual(pg['g5b_status'], 'NOT_APPLICABLE_NONPOSITIVE_GLOBAL_PNL')
+        self.assertNotIn('G5b', pg['pending_gates'])
+        self.assertNotIn('G5b', pg['failed_gates'])
+        self.assertEqual(pg['g5b_global_pnl'], Decimal("-10.0"))
+        self.assertEqual(pg['g5b_largest_loss'], Decimal("-15.0"))
+        self.assertIsNone(pg['g5b_stressed_pnl'])
+
+    def test_g5b_no_losses(self):
+        """G5b: all trades winning -> NOT_APPLICABLE_NO_LOSSES, satisfied (not pending/failed)"""
+        df = pd.DataFrame({'open': [100.0]*200, 'high': [105.0]*200, 'low': [95.0]*200, 'close': [100.0]*200})
+        def strategy(df, p):
+            df['signal'] = 0
+            df.loc[110, 'signal'] = 1
+            df.loc[120, 'signal'] = -2
+            df.loc[130, 'signal'] = 1
+            df.loc[140, 'signal'] = -2
+            return df
+        df.loc[111, 'open'] = 100.0
+        df.loc[121, 'open'] = 110.0
+        df.loc[131, 'open'] = 100.0
+        df.loc[141, 'open'] = 105.0
+        res = walk_forward_test(strategy, {'p': [1]}, df, train_window=100, test_window=100, step=100,
+                                purge_bars=0, embargo_bars=0, fee_rate=0.0, min_trades_for_g5=0,
+                                min_trades_for_g5b=2, entry_slippage=0.0, stop_slippage=0.0)
+        pg = res['portfolio_gates']
+        self.assertEqual(pg['G5b'], 'NOT_APPLICABLE_NO_LOSSES')
+        self.assertEqual(pg['g5b_status'], 'NOT_APPLICABLE_NO_LOSSES')
+        self.assertNotIn('G5b', pg['pending_gates'])
+        self.assertNotIn('G5b', pg['failed_gates'])
+        self.assertEqual(pg['g5b_global_pnl'], Decimal("15.0"))
+        self.assertIsNone(pg['g5b_largest_loss'])
+        self.assertIsNone(pg['g5b_stressed_pnl'])
+
+    def test_g5b_robust_profitable_pass(self):
+        """G5b: robust profitable case (stressed_pnl >= 0) -> PASS"""
+        df = pd.DataFrame({'open': [100.0]*200, 'high': [105.0]*200, 'low': [95.0]*200, 'close': [100.0]*200})
+        def strategy(df, p):
+            df['signal'] = 0
+            # 3 trades in test window
+            df.loc[110, 'signal'] = 1
+            df.loc[120, 'signal'] = -2
+            df.loc[130, 'signal'] = 1
+            df.loc[140, 'signal'] = -2
+            df.loc[150, 'signal'] = 1
+            df.loc[160, 'signal'] = -2
+            return df
+        # trade 1: +10, trade 2: +10, trade 3: -3
+        # global = 17, largest_loss = -3, stressed = 17 + (-3) = 14 >= 0 -> PASS
+        df.loc[111, 'open'] = 100.0
+        df.loc[121, 'open'] = 110.0
+        df.loc[131, 'open'] = 100.0
+        df.loc[141, 'open'] = 110.0
+        df.loc[151, 'open'] = 100.0
+        df.loc[161, 'open'] = 97.0
+        res = walk_forward_test(strategy, {'p': [1]}, df, train_window=100, test_window=100, step=100,
+                                purge_bars=0, embargo_bars=0, fee_rate=0.0, min_trades_for_g5=0,
+                                min_trades_for_g5b=3, entry_slippage=0.0, stop_slippage=0.0)
+        pg = res['portfolio_gates']
+        self.assertEqual(pg['G5b'], 'PASS')
+        self.assertEqual(pg['g5b_status'], 'PASS')
+        self.assertEqual(pg['g5b_global_pnl'], Decimal("17.0"))
+        self.assertEqual(pg['g5b_largest_loss'], Decimal("-3.0"))
+        self.assertEqual(pg['g5b_stressed_pnl'], Decimal("14.0"))
+        self.assertNotIn('G5b', pg['failed_gates'])
+        self.assertNotIn('G5b', pg['pending_gates'])
+
+    def test_g5b_fragile_profitable_fail(self):
+        """G5b: fragile profitable case (stressed_pnl < 0) -> FAIL, in failed_gates, overall_pass False"""
+        df = pd.DataFrame({'open': [100.0]*200, 'high': [105.0]*200, 'low': [95.0]*200, 'close': [100.0]*200})
+        def strategy(df, p):
+            df['signal'] = 0
+            df.loc[110, 'signal'] = 1
+            df.loc[120, 'signal'] = -2
+            df.loc[130, 'signal'] = 1
+            df.loc[140, 'signal'] = -2
+            return df
+        # trade 1: +5, trade 2: -4
+        # global = 1, largest_loss = -4, stressed = 1 + (-4) = -3 < 0 -> FAIL
+        df.loc[111, 'open'] = 100.0
+        df.loc[121, 'open'] = 105.0
+        df.loc[131, 'open'] = 100.0
+        df.loc[141, 'open'] = 96.0
+        res = walk_forward_test(strategy, {'p': [1]}, df, train_window=100, test_window=100, step=100,
+                                purge_bars=0, embargo_bars=0, fee_rate=0.0, min_trades_for_g5=0,
+                                min_trades_for_g5b=2, entry_slippage=0.0, stop_slippage=0.0)
+        pg = res['portfolio_gates']
+        self.assertEqual(pg['G5b'], 'FAIL')
+        self.assertEqual(pg['g5b_status'], 'FAIL')
+        self.assertEqual(pg['g5b_global_pnl'], Decimal("1.0"))
+        self.assertEqual(pg['g5b_largest_loss'], Decimal("-4.0"))
+        self.assertEqual(pg['g5b_stressed_pnl'], Decimal("-3.0"))
+        self.assertIn('G5b', pg['failed_gates'])
+        self.assertFalse(pg['overall_pass'])
+        self.assertFalse(res['overall_pass'])
+
+    def test_g5b_fee_and_quantity_semantics(self):
+        """G5b uses official completed-trade Decimal PnL: entry fee, exit fee, and quantity affect result"""
+        # Unit verification with official_completed_trade_pnl
+        trade_base = {
+            'direction': 'long',
+            'entry_fill': {'fill_price': 100.0, 'fee': 0.0},
+            'exit_fill': {'fill_price': 105.0, 'fee': 0.0},
+            'quantity': 1.0,
+        }
+        self.assertEqual(official_completed_trade_pnl(trade_base), Decimal("5.0"))
+
+        # Entry fee reduces PnL
+        trade_entry_fee = {
+            'direction': 'long',
+            'entry_fill': {'fill_price': 100.0, 'fee': 2.0},
+            'exit_fill': {'fill_price': 105.0, 'fee': 0.0},
+            'quantity': 1.0,
+        }
+        self.assertEqual(official_completed_trade_pnl(trade_entry_fee), Decimal("3.0"))
+
+        # Exit fee reduces PnL
+        trade_exit_fee = {
+            'direction': 'long',
+            'entry_fill': {'fill_price': 100.0, 'fee': 0.0},
+            'exit_fill': {'fill_price': 105.0, 'fee': 1.5},
+            'quantity': 1.0,
+        }
+        self.assertEqual(official_completed_trade_pnl(trade_exit_fee), Decimal("3.5"))
+
+        # Quantity scales gross PnL
+        trade_scaled_qty = {
+            'direction': 'long',
+            'entry_fill': {'fill_price': 100.0, 'fee': 0.5},
+            'exit_fill': {'fill_price': 105.0, 'fee': 0.5},
+            'quantity': 2.0,
+        }
+        # gross = (105 - 100) * 2 = 10, net = 10 - 0.5 - 0.5 = 9.0
+        self.assertEqual(official_completed_trade_pnl(trade_scaled_qty), Decimal("9.0"))
+
+    def test_g5b_portfolio_gates_fields_presence(self):
+        """All 7 required G5b fields appear in portfolio_gates with Decimal / proper types"""
+        df = pd.DataFrame({'open': [100.0]*100, 'high': [105.0]*100, 'low': [95.0]*100, 'close': [100.0]*100})
+        def strategy(df, p):
+            df['signal'] = 0
+            return df
+        res = walk_forward_test(strategy, {'p': [1]}, df, train_window=50, test_window=50, step=50,
+                                entry_slippage=0.0, stop_slippage=0.0)
+        pg = res['portfolio_gates']
+        required_fields = [
+            'G5b', 'g5b_status', 'g5b_completed_trade_count',
+            'g5b_global_pnl', 'g5b_largest_loss', 'g5b_stressed_pnl', 'g5b_min_trades',
+        ]
+        for f in required_fields:
+            self.assertIn(f, pg, f"Missing required G5b field: {f}")
+
+    def test_g5b_aggregate_gate_statuses_pass_removes_pending(self):
+        """G5b PASS removes G5b from pending_gates; G5b FAIL adds to failed_gates"""
+        # All pass
+        status_map_pass = {
+            'G1_G3_MEAN_RETURN': 'PASS',
+            'G4': 'PASS',
+            'G5': 'PASS',
+            'G5b': 'PASS',
+            'G6': 'PASS',
+        }
+        overall, failed, pending = aggregate_gate_statuses(status_map_pass)
+        self.assertNotIn('G5b', pending)
+        self.assertNotIn('G5b', failed)
+        self.assertTrue(overall)
+
+        # G5b fails
+        status_map_fail = {
+            'G1_G3_MEAN_RETURN': 'PASS',
+            'G4': 'PASS',
+            'G5': 'PASS',
+            'G5b': 'FAIL',
+            'G6': 'PASS',
+        }
+        overall, failed, pending = aggregate_gate_statuses(status_map_fail)
+        self.assertIn('G5b', failed)
+        self.assertNotIn('G5b', pending)
+        self.assertFalse(overall)
+
+        # G5b insufficient
+        status_map_insufficient = {
+            'G1_G3_MEAN_RETURN': 'PASS',
+            'G4': 'PASS',
+            'G5': 'PASS',
+            'G5b': 'INSUFFICIENT_TRADES',
+            'G6': 'PASS',
+        }
+        overall, failed, pending = aggregate_gate_statuses(status_map_insufficient)
+        self.assertIn('G5b', pending)
+        self.assertNotIn('G5b', failed)
+        self.assertFalse(overall)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -388,8 +388,35 @@ def walk_forward_test(
         else:
             g5_status = 'PASS'
 
-    # G5b and G6 — NOT computed in legacy single-asset mode. No adapter exists.
-    g5b_status = 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER'
+    # G5b Loss Stress Test — Decimal official completed-trade PnL
+    min_trades_for_g5b = kwargs.get('min_trades_for_g5b', 10)
+
+    if g5_completed_trade_count < min_trades_for_g5b:
+        g5b_status = 'INSUFFICIENT_TRADES'
+        g5b_global_pnl = None
+        g5b_largest_loss = None
+        g5b_stressed_pnl = None
+    else:
+        g5b_global_pnl = sum(official_pnls, Decimal("0"))
+        g5b_losses = [p for p in official_pnls if p < Decimal("0")]
+
+        if g5b_global_pnl <= Decimal("0"):
+            g5b_status = 'NOT_APPLICABLE_NONPOSITIVE_GLOBAL_PNL'
+            g5b_largest_loss = min(g5b_losses) if g5b_losses else None
+            g5b_stressed_pnl = None
+        elif not g5b_losses:
+            g5b_status = 'NOT_APPLICABLE_NO_LOSSES'
+            g5b_largest_loss = None
+            g5b_stressed_pnl = None
+        else:
+            g5b_largest_loss = min(g5b_losses)  # most negative value
+            g5b_stressed_pnl = g5b_global_pnl + g5b_largest_loss  # doubles the loss
+            if g5b_stressed_pnl >= Decimal("0"):
+                g5b_status = 'PASS'
+            else:
+                g5b_status = 'FAIL'
+
+    # G6 — NOT computed in legacy single-asset mode. No adapter exists.
     g6_status = 'NOT_EVALUATED_PENDING_LEGACY_ADAPTER'
 
     gate_status_map = {
@@ -427,8 +454,15 @@ def walk_forward_test(
         'top_profit': g5_top_profit,
         'total_positive_profit': g5_total_positive_profit,
         'top5_share': g5_top5_share,
+        # G5b fields
         'G5b': g5b_status,
         'g5b_status': g5b_status,
+        'g5b_completed_trade_count': g5_completed_trade_count,
+        'g5b_global_pnl': g5b_global_pnl,
+        'g5b_largest_loss': g5b_largest_loss,
+        'g5b_stressed_pnl': g5b_stressed_pnl,
+        'g5b_min_trades': min_trades_for_g5b,
+        # G6 fields
         'G6': g6_status,
         'g6_status': g6_status,
         'bootstrap': None,
