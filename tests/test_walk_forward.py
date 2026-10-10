@@ -161,5 +161,37 @@ class TestWalkForward(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_legacy_walk_forward_result(broken)
 
+    def test_additive_evidence_capture_fields(self):
+        """Verifies additive exposure of shock_trade_records and portfolio_gates['official_monetary_pnl']"""
+        from decimal import Decimal
+        from validation_engine.walk_forward import official_completed_trade_pnl
+        
+        df = pd.DataFrame({
+            'open': [100.0] * 300,
+            'high': [115.0] * 300,
+            'low': [90.0] * 300,
+            'close': [100.0] * 300,
+            'signal': [0] * 300
+        })
+        # Generate signals in test window (train: 100, test: 50)
+        df.loc[110, 'signal'] = 1
+        df.loc[120, 'signal'] = -1
+        df.loc[130, 'signal'] = 1
+        df.loc[140, 'signal'] = -1
+        
+        res = walk_forward_test(
+            lambda d, **k: d, {'sl': [0.10], 'tp': [0.15]}, df,
+            train_window=100, test_window=50, step=50,
+            entry_slippage=0.0, stop_slippage=0.0
+        )
+        self.assertIn('shock_trade_records', res)
+        self.assertIsInstance(res['shock_trade_records'], list)
+        self.assertIn('official_monetary_pnl', res['portfolio_gates'])
+        self.assertIsInstance(res['portfolio_gates']['official_monetary_pnl'], Decimal)
+        
+        expected_pnl = sum([official_completed_trade_pnl(t) for t in res['trade_records']], Decimal("0"))
+        self.assertEqual(res['portfolio_gates']['official_monetary_pnl'], expected_pnl)
+
 if __name__ == '__main__':
     unittest.main()
+

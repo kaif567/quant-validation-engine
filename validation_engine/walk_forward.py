@@ -20,6 +20,7 @@ class LegacyWalkForwardResult(TypedDict):
     pending_gates: Optional[list[str]]
     bootstrap: Optional[Any]
     top5_share: Optional[Any]
+    shock_trade_records: Optional[list[dict]]
 
 def official_completed_trade_pnl(trade: dict) -> Decimal:
     """
@@ -105,6 +106,10 @@ def validate_legacy_walk_forward_result(result: dict) -> None:
             f"overall_pass mismatch: result['overall_pass']={result['overall_pass']} "
             f"!= portfolio_gates['overall_pass']={pg['overall_pass']}"
         )
+
+    if 'shock_trade_records' in result and result['shock_trade_records'] is not None:
+        if not isinstance(result['shock_trade_records'], list):
+            raise TypeError(f"Key shock_trade_records must be a list, got {type(result['shock_trade_records'])}")
 
 
 # Gate status categories (reference_design/multi_asset_orchestrator.py L47-56, L309-350):
@@ -358,8 +363,8 @@ def walk_forward_test(
         g1_g3_status = 'INSUFFICIENT_TRADES'
     
     # G4 Cost Shock Replay
+    all_shock_trades = []
     if all_oos_trades:
-        all_shock_trades = []
         current_start_shock = 0
         idx = 0
         while current_start_shock + initial_train_window + purge_bars + test_window <= total_len:
@@ -581,6 +586,7 @@ def walk_forward_test(
         'g6_q05': g6_q05,
         'full_bootstrap_artifact_hash': g6_hash,
         'bootstrap': g6_artifact,
+        'official_monetary_pnl': sum(official_pnls, Decimal("0")),
     }
 
     result: LegacyWalkForwardResult = {
@@ -593,6 +599,7 @@ def walk_forward_test(
         'pending_gates': pending_gates,
         'overall_pass': overall_pass,
         'trade_records': all_oos_trades,
+        'shock_trade_records': all_shock_trades,
         'raw_trial_ledger_ref': run_id,
         'bootstrap': g6_artifact,
         'top5_share': None
