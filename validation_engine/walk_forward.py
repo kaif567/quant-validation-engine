@@ -207,12 +207,24 @@ def walk_forward_test(
         for params in param_combinations:
             sim_train = strategy_function(train_df.copy(), **params)
             
+            tp_param = params.get('take_profit', params.get('tp', None))
+            target_roi = params.get('target_roi', kwargs.get('target_roi', None))
+            f_rate = params.get('fee_rate', fee_rate)
+            e_slip = kwargs.get('entry_slippage', 0.0)
+            s_slip = kwargs.get('stop_slippage', 0.0)
+            if target_roi is not None and tp_param is None:
+                eff_entry = Decimal(str(f_rate)) + Decimal(str(e_slip))
+                eff_exit = Decimal(str(f_rate)) + Decimal(str(s_slip))
+                target_roi_dec = Decimal(str(target_roi))
+                tp_param = float((Decimal("1") + target_roi_dec) * (Decimal("1") + eff_entry) / (Decimal("1") - eff_exit) - Decimal("1"))
+
             sim_kwargs = {
                 'stop_loss': params.get('stop_loss', params.get('sl', None)),
-                'take_profit': params.get('take_profit', params.get('tp', None)),
-                'fee_rate': params.get('fee_rate', fee_rate),
-                'entry_slippage': kwargs.get('entry_slippage', 0.0),
-                'stop_slippage': kwargs.get('stop_slippage', 0.0)
+                'take_profit': tp_param,
+                'fee_rate': f_rate,
+                'entry_slippage': e_slip,
+                'stop_slippage': s_slip,
+                'execution_model': kwargs.get('execution_model', 'v1_legacy')
             }
             sim_kwargs = {k: v for k, v in sim_kwargs.items() if v is not None}
             
@@ -270,12 +282,24 @@ def walk_forward_test(
                 ledger.record_event('selection', {'fold_id': len(fold_results), 'selected': True, 'objective_value': best_pf})
             sim_test = strategy_function(test_df.copy(), **best_params)
             
+            tp_param = best_params.get('take_profit', best_params.get('tp', None))
+            target_roi = best_params.get('target_roi', kwargs.get('target_roi', None))
+            f_rate = best_params.get('fee_rate', fee_rate)
+            e_slip = kwargs.get('entry_slippage', 0.0)
+            s_slip = kwargs.get('stop_slippage', 0.0)
+            if target_roi is not None and tp_param is None:
+                eff_entry = Decimal(str(f_rate)) + Decimal(str(e_slip))
+                eff_exit = Decimal(str(f_rate)) + Decimal(str(s_slip))
+                target_roi_dec = Decimal(str(target_roi))
+                tp_param = float((Decimal("1") + target_roi_dec) * (Decimal("1") + eff_entry) / (Decimal("1") - eff_exit) - Decimal("1"))
+
             sim_kwargs = {
                 'stop_loss': best_params.get('stop_loss', best_params.get('sl', None)),
-                'take_profit': best_params.get('take_profit', best_params.get('tp', None)),
-                'fee_rate': best_params.get('fee_rate', fee_rate),
-                'entry_slippage': kwargs.get('entry_slippage', 0.0),
-                'stop_slippage': kwargs.get('stop_slippage', 0.0)
+                'take_profit': tp_param,
+                'fee_rate': f_rate,
+                'entry_slippage': e_slip,
+                'stop_slippage': s_slip,
+                'execution_model': kwargs.get('execution_model', 'v1_legacy')
             }
             sim_kwargs = {k: v for k, v in sim_kwargs.items() if v is not None}
             
@@ -346,12 +370,24 @@ def walk_forward_test(
                 best_p = fold_results[idx]['best_params']
                 if best_p:
                     sim_test = strategy_function(test_df.copy(), **best_p)
+                    f_rate_shock = best_p.get('fee_rate', fee_rate) * 2
+                    e_slip_shock = kwargs.get('entry_slippage', 0.0) * 2
+                    s_slip_shock = kwargs.get('stop_slippage', 0.0) * 2
+                    tp_param_shock = best_p.get('take_profit', best_p.get('tp', None))
+                    target_roi = best_p.get('target_roi', kwargs.get('target_roi', None))
+                    if target_roi is not None:
+                        eff_entry_shock = Decimal(str(f_rate_shock)) + Decimal(str(e_slip_shock))
+                        eff_exit_shock = Decimal(str(f_rate_shock)) + Decimal(str(s_slip_shock))
+                        target_roi_dec = Decimal(str(target_roi))
+                        tp_param_shock = float((Decimal("1") + target_roi_dec) * (Decimal("1") + eff_entry_shock) / (Decimal("1") - eff_exit_shock) - Decimal("1"))
+
                     shock_kwargs = {
                         'stop_loss': best_p.get('stop_loss', best_p.get('sl', None)),
-                        'take_profit': best_p.get('take_profit', best_p.get('tp', None)),
-                        'fee_rate': best_p.get('fee_rate', fee_rate) * 2,
-                        'entry_slippage': kwargs.get('entry_slippage', 0.0) * 2,
-                        'stop_slippage': kwargs.get('stop_slippage', 0.0) * 2
+                        'take_profit': tp_param_shock,
+                        'fee_rate': f_rate_shock,
+                        'entry_slippage': e_slip_shock,
+                        'stop_slippage': s_slip_shock,
+                        'execution_model': kwargs.get('execution_model', 'v1_legacy')
                     }
                     shock_kwargs = {k: v for k, v in shock_kwargs.items() if v is not None}
                     shock_trades, _, _ = simulate_trades(sim_test, **shock_kwargs)

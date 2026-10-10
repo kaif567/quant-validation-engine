@@ -193,6 +193,615 @@ class ShadowCapitalLedgerTracker:
         }
 
 
+def _simulate_trades_v2_causal(
+    df,
+    mode='base',
+    fee_rate=0.001,
+    entry_slippage=Decimal("0"),
+    stop_slippage=Decimal("0"),
+    stop_loss=None,
+    take_profit=None,
+    delisted_info=None,
+    liquidity_config=None,
+    bars_per_day=24,
+    intended_quantity=1.0,
+    initial_cash=1000000000.0,
+    track_shadow_ledger=False,
+    shadow_tracker=None
+):
+    trades = []
+    rejected_events = []
+    decision_traces = []
+    current_cash = Decimal(str(initial_cash))
+    current_gross_exposure = Decimal("0")
+    current_position_count = 0
+
+    position = None
+    entry_price = 0.0
+    entry_time = None
+    entry_fill_obj = None
+    entry_current_position_direction = 'long'
+    pending_exit = None
+    pending_entry = None
+    pending_entry_signal_row = None
+
+    tiering_enabled = liquidity_config.get('liquidity_tiering_enabled', False)
+    capacity_enabled = liquidity_config.get('capacity_constraint_enabled', False)
+
+    for i in range(len(df)):
+        bar = df.iloc[i]
+        prior_bar = df.iloc[i - 1] if i > 0 else None
+
+        if delisted_info is not None and bar.name >= delisted_info['delisted_time']:
+            if position is not None:
+                exit_price = float(prior_bar['close']) if prior_bar is not None else float(bar['open'])
+                exit_reason = "FORCED_DELISTING_EXIT"
+                exit_order_type = "UNRESOLVED"
+                exit_fill_obj = {
+                    'bar_index': i,
+                    'order_type': exit_order_type,
+                    'requested_price': None,
+                    'fill_price': exit_price,
+                    'last_observed_mark': exit_price,
+                    'mode': mode,
+                    'gap_fill': False,
+                    'reason': exit_reason,
+                    'terminal_value_unverified': True,
+                    'liquidity_diagnostics': {'exit_liquidity_modeled': False}
+                }
+                trades.append({
+                    'entry_time': entry_time,
+                    'exit_time': bar.name,
+                    'entry_price': entry_price,
+                    'exit_price': exit_price,
+                    'net_return': None,
+                    'unresolved_notional': exit_price,
+                    'exit_reason': exit_reason,
+                    'entry_fill': entry_fill_obj,
+                    'exit_fill': exit_fill_obj
+                })
+                position = None
+                entry_fill_obj = None
+            break
+
+        # 1. Pending market exits at current open (cannot be overridden by later intrabar extremes)
+        if position is not None and pending_exit is not None:
+            req_price = float(bar['open'])
+            atr_val = float(Decimal(str(prior_bar['atr'] if prior_bar is not None and 'atr' in prior_bar else (bar['atr'] if 'atr' in bar else 0.0))))
+            if position == 'LONG':
+                exit_price = req_price if entry_slippage == Decimal("0") else req_price - (atr_val * float(entry_slippage))
+            else:
+                exit_price = req_price if entry_slippage == Decimal("0") else req_price + (atr_val * float(entry_slippage))
+
+            exit_order_type = pending_exit['order_type']
+            exit_reason = pending_exit['reason']
+
+            gross_return = (exit_price - entry_price) / entry_price if position == 'LONG' else (entry_price - exit_price) / entry_price
+            net_return = gross_return - (2 * fee_rate)
+            exit_fee_amount = exit_price * intended_quantity * fee_rate
+
+            exit_fill_obj = {
+                'bar_index': i,
+                'order_type': exit_order_type,
+                'requested_price': req_price,
+                'fill_price': exit_price,
+                'fee': exit_fee_amount,
+                'quantity': intended_quantity,
+                'last_observed_mark': None,
+                'mode': mode,
+                'gap_fill': False,
+                'reason': exit_reason,
+                'terminal_value_unverified': False,
+                'liquidity_diagnostics': {'exit_liquidity_modeled': False}
+            }
+
+            entry_notional = Decimal(str(entry_fill_obj['quantity'])) * Decimal(str(entry_fill_obj['fill_price']))
+            exit_notional = Decimal(str(intended_quantity)) * Decimal(str(exit_price))
+            if entry_current_position_direction.lower() == 'long':
+                gross_pnl_exit = exit_notional - entry_notional
+            else:
+                gross_pnl_exit = entry_notional - exit_notional
+            current_cash += entry_notional + gross_pnl_exit - Decimal(str(exit_fee_amount))
+            current_gross_exposure = Decimal("0")
+            current_position_count = 0
+
+            trades.append({
+                'entry_time': entry_time,
+                'exit_time': bar['open_time'] if 'open_time' in bar else bar.name,
+                'entry_price': entry_price,
+                'exit_price': exit_price,
+                'quantity': intended_quantity,
+                'direction': 'long' if entry_current_position_direction.lower() == 'long' else 'short',
+                'entry_fee': entry_fill_obj.get('fee', 0.0),
+                'exit_fee': exit_fee_amount,
+                'net_return': net_return,
+                'exit_reason': exit_reason,
+                'entry_fill': entry_fill_obj,
+                'exit_fill': exit_fill_obj
+            })
+            if shadow_tracker:
+                _exit_dir = 'long' if entry_current_position_direction.lower() == 'long' else 'short'
+                shadow_tracker.record_exit(
+                    fill_price=Decimal(str(exit_price)),
+                    quantity=Decimal(str(intended_quantity)),
+                    fee=Decimal(str(exit_fee_amount)),
+                    direction=_exit_dir
+                )
+            position = None
+            entry_fill_obj = None
+            pending_exit = None
+
+        # 2. Eligible entries at current open
+        if position is None and pending_entry in [1, -1]:
+            req_px = float(bar['open'])
+            tier_factor = 1.0
+            capacity_cap = float('inf')
+            missing_tier = False
+            missing_cap = False
+
+            sig_row = pending_entry_signal_row if pending_entry_signal_row is not None else prior_bar
+            p_30d = float(sig_row.get('prior_30d_avg_daily_quote_volume', float('nan'))) if sig_row is not None else float('nan')
+            p_24h = float(sig_row.get('prior_24h_quote_volume', float('nan'))) if sig_row is not None else float('nan')
+
+            if pd.isna(p_30d) or i < 30 * bars_per_day: missing_tier = True
+            if pd.isna(p_24h) or i < bars_per_day: missing_cap = True
+
+            applied_policy = "NONE"
+            rejected = False
+            reject_reason = ""
+
+            is_missing = (tiering_enabled and missing_tier) or (capacity_enabled and missing_cap)
+            if is_missing:
+                policy = liquidity_config.get('missing_data_policy', 'REJECT')
+                if tiering_enabled and capacity_enabled and (missing_tier or missing_cap):
+                    rejected = True
+                    reject_reason = "REJECT_MISSING_DATA_CAP_AND_TIER"
+                    applied_policy = "REJECT"
+                elif tiering_enabled and not capacity_enabled and missing_tier:
+                    if policy == 'REJECT':
+                        rejected = True
+                        reject_reason = "REJECT_MISSING_TIER_DATA"
+                        applied_policy = "REJECT"
+                    elif policy == 'CONSERVATIVE_LOW_TIER':
+                        tier_factor = 3.0
+                        applied_policy = "CONSERVATIVE_LOW_TIER"
+                elif not tiering_enabled and capacity_enabled and missing_cap:
+                    rejected = True
+                    reject_reason = "REJECT_MISSING_CAP_DATA"
+                    applied_policy = "REJECT"
+                elif not tiering_enabled and not capacity_enabled:
+                    applied_policy = "LEGACY_NO_LIMITS"
+
+            if tiering_enabled and not missing_tier:
+                metric_val = p_30d if liquidity_config.get('tier_metric') == 'prior_30d_avg_daily_quote_volume' else p_24h
+                tiers = liquidity_config.get('tiers', [])
+                for t in sorted(tiers, key=lambda x: x['min_quote_volume'], reverse=True):
+                    if metric_val >= t['min_quote_volume']:
+                        tier_factor = float(t['tier_factor'])
+                        break
+
+            if capacity_enabled and not missing_cap:
+                part_rate = liquidity_config.get('capacity', {}).get('participation_rate_cap', 0.05)
+                capacity_cap = part_rate * p_24h
+
+            atr_val = float(Decimal(str(sig_row['atr'] if sig_row is not None and 'atr' in sig_row else (bar['atr'] if 'atr' in bar else 0.0))))
+            slip_amt = 0.0 if entry_slippage == Decimal("0") else (atr_val * float(entry_slippage) * tier_factor)
+
+            est_fill_px = req_px + slip_amt if pending_entry == 1 else req_px - slip_amt
+            if math.isnan(est_fill_px) or est_fill_px <= 0:
+                rejected = True
+                reject_reason = "INVALID_ESTIMATED_FILL_PRICE"
+
+            req_ref_notional = intended_quantity * req_px
+            req_exec_notional = intended_quantity * est_fill_px
+            approved_notional = req_exec_notional
+
+            if not rejected and capacity_enabled:
+                if req_exec_notional > capacity_cap:
+                    action = liquidity_config.get('capacity', {}).get('action', 'REJECT')
+                    if action == 'REJECT':
+                        rejected = True
+                        reject_reason = "REQUESTED_EXECUTION_NOTIONAL_EXCEEDS_CAP"
+                    elif action == 'RESIZE':
+                        approved_notional = capacity_cap
+
+            diag_obj = _build_liquidity_diag_normalized(
+                bars_per_day=bars_per_day,
+                required_lookback_bars=30 * bars_per_day if tiering_enabled else bars_per_day,
+                p_30d=p_30d,
+                p_24h=p_24h,
+                prior_intrabar_range_fraction=float(sig_row.get('prior_intrabar_range_fraction', 0.0)) if sig_row is not None else 0.0,
+                req_ref_notional=req_ref_notional,
+                req_exec_notional=req_exec_notional,
+                est_fill_px=est_fill_px,
+                capacity_cap=capacity_cap,
+                approved_notional=approved_notional,
+                participation_rate_cap=liquidity_config.get('capacity', {}).get('participation_rate_cap', 0.05) if capacity_enabled else None,
+                tier_factor=tier_factor,
+                capacity_action="REJECT" if rejected else liquidity_config.get('capacity', {}).get('action', 'ACCEPT'),
+                missing_data_policy_applied=applied_policy,
+                signal_bar_time=sig_row.name if sig_row is not None else bar.name,
+                execution_bar_time=bar.name,
+                tiering_enabled=tiering_enabled,
+                capacity_enabled=capacity_enabled,
+                missing_tier=missing_tier,
+                missing_cap=missing_cap,
+                reject_reason=reject_reason,
+            )
+
+            _req_qty_dec = Decimal(str(intended_quantity))
+            _req_px_dec = Decimal(str(req_px))
+            _req_notional_dec = _req_qty_dec * _req_px_dec
+            _slip_dec = Decimal(str(slip_amt))
+            _est_fill_px_dec = Decimal(str(est_fill_px))
+            _req_exec_notional_dec = _req_qty_dec * _est_fill_px_dec
+
+            free_cash_before = current_cash
+            gross_exposure_before = current_gross_exposure
+            position_count_before = current_position_count
+
+            if not rejected:
+                if _est_fill_px_dec.is_nan() or _est_fill_px_dec <= Decimal("0"):
+                    rejected = True
+                    reject_reason = "INVALID_ESTIMATED_FILL_PRICE"
+                elif not _req_exec_notional_dec.is_nan() and free_cash_before < _req_exec_notional_dec:
+                    rejected = True
+                    reject_reason = "INSUFFICIENT_CASH"
+
+            if rejected:
+                _g4_trace = {
+                    "attempt_id": f"sim_{i}_{str(bar.name)}",
+                    "timestamp": str(bar.name),
+                    "symbol": "single_asset",
+                    "requested_qty": _req_qty_dec,
+                    "requested_notional": _req_notional_dec,
+                    "approved_qty": Decimal("0"),
+                    "approved_notional": Decimal("0"),
+                    "fill_price": Decimal("0"),
+                    "slippage_amount": _slip_dec,
+                    "entry_fee": Decimal("0"),
+                    "exit_fee_reserve": Decimal("0"),
+                    "free_cash_before": free_cash_before,
+                    "free_cash_after": free_cash_before,
+                    "gross_exposure_before": gross_exposure_before,
+                    "gross_exposure_after": gross_exposure_before,
+                    "position_count_before": position_count_before,
+                    "position_count_after": position_count_before,
+                    "status": "REJECTED",
+                    "rejection_reason": reject_reason,
+                }
+                decision_traces.append(_g4_trace)
+                rejected_events.append({
+                    "event_type": "trade_rejected_missing_liquidity_data" if "MISSING" in reject_reason else "trade_rejected_liquidity_cap",
+                    "payload": {
+                        "reject_reason": reject_reason,
+                        "causal_input_timestamps": {
+                            "signal_bar_time": str(sig_row.name if sig_row is not None else bar.name),
+                            "execution_bar_time": str(bar.name)
+                        },
+                        "liquidity_inputs": diag_obj
+                    }
+                })
+            else:
+                _approved_qty_dec = _req_qty_dec
+                _approved_notional_dec = _approved_qty_dec * _est_fill_px_dec
+                fee_rate_dec = Decimal(str(fee_rate))
+                _entry_fee_dec = _approved_notional_dec * fee_rate_dec
+                _exit_fee_reserve_dec = _entry_fee_dec
+
+                free_cash_after = free_cash_before - _approved_notional_dec - _entry_fee_dec
+                gross_exposure_after = gross_exposure_before + _approved_notional_dec
+                position_count_after = position_count_before + 1
+
+                _g4_trace = {
+                    "attempt_id": f"sim_{i}_{str(bar.name)}",
+                    "timestamp": str(bar.name),
+                    "symbol": "single_asset",
+                    "requested_qty": _req_qty_dec,
+                    "requested_notional": _req_notional_dec,
+                    "approved_qty": _approved_qty_dec,
+                    "approved_notional": _approved_notional_dec,
+                    "fill_price": _est_fill_px_dec,
+                    "slippage_amount": _slip_dec,
+                    "entry_fee": _entry_fee_dec,
+                    "exit_fee_reserve": _exit_fee_reserve_dec,
+                    "free_cash_before": free_cash_before,
+                    "free_cash_after": free_cash_after,
+                    "gross_exposure_before": gross_exposure_before,
+                    "gross_exposure_after": gross_exposure_after,
+                    "position_count_before": position_count_before,
+                    "position_count_after": position_count_after,
+                    "status": "ACCEPTED",
+                    "rejection_reason": None,
+                }
+                decision_traces.append(_g4_trace)
+
+                current_cash = free_cash_after
+                current_gross_exposure = gross_exposure_after
+                current_position_count = position_count_after
+
+                position = 'LONG' if pending_entry == 1 else 'SHORT'
+                entry_price = est_fill_px
+                entry_time = bar['open_time'] if 'open_time' in bar else bar.name
+                entry_qty = intended_quantity
+                entry_fee_amount = float(_entry_fee_dec)
+                entry_fill_obj = {
+                    'bar_index': i,
+                    'order_type': 'MARKET_ENTRY',
+                    'requested_price': req_px,
+                    'fill_price': est_fill_px,
+                    'fee': entry_fee_amount,
+                    'quantity': entry_qty,
+                    'mode': mode,
+                    'gap_fill': False,
+                    'reason': 'SIGNAL_LONG' if pending_entry == 1 else 'SIGNAL_SHORT',
+                    'time': bar.name,
+                    'liquidity_diagnostics': diag_obj
+                }
+                entry_current_position_direction = 'long' if pending_entry == 1 else 'short'
+                if shadow_tracker:
+                    _entry_dir = 'long' if pending_entry == 1 else 'short'
+                    shadow_tracker.record_entry(
+                        fill_price=_est_fill_px_dec,
+                        quantity=_approved_qty_dec,
+                        fee=_entry_fee_dec,
+                        direction=_entry_dir
+                    )
+            pending_entry = None
+            pending_entry_signal_row = None
+
+        # 3. Entry-bar and subsequent-bar intrabar protective checks
+        if position is not None and stop_loss is not None and take_profit is not None:
+            exit_price = None
+            exit_reason = None
+            exit_order_type = None
+            gap_fill = False
+            req_price = None
+            applied_slippage = 0.0
+            atr_val = float(Decimal(str(prior_bar['atr'] if prior_bar is not None and 'atr' in prior_bar else (bar['atr'] if 'atr' in bar else 0.0))))
+
+            is_entry_bar = (entry_fill_obj is not None and entry_fill_obj.get('bar_index') == i)
+
+            if position == 'LONG':
+                sl_price = entry_price * (1 - stop_loss)
+                tp_price = entry_price * (1 + take_profit)
+
+                # Open gaps are only evaluated if entered prior to current bar
+                if not is_entry_bar:
+                    if bar['open'] <= sl_price:
+                        exit_price = float(bar['open']) if stop_slippage == Decimal("0") else float(bar['open']) - (atr_val * float(stop_slippage))
+                        exit_reason = "STOP_LOSS_GAP"
+                        applied_slippage = stop_slippage
+                        exit_order_type = "STOP_MARKET"
+                        gap_fill = True
+                        req_price = sl_price
+                    elif bar['open'] >= tp_price:
+                        exit_price = tp_price
+                        exit_reason = "TAKE_PROFIT_GAP"
+                        applied_slippage = 0.0
+                        exit_order_type = "LIMIT"
+                        gap_fill = True
+                        req_price = tp_price
+
+                if exit_price is None:
+                    hit_sl = bar['low'] <= sl_price
+                    hit_tp = bar['high'] >= tp_price
+
+                    if hit_sl and hit_tp:
+                        sl_first = True if mode in ('pessimistic', 'base') else (False if mode == 'optimistic' else (bar['open'] - bar['low'] <= bar['high'] - bar['open']))
+                        if sl_first:
+                            exit_price = sl_price if stop_slippage == Decimal("0") else sl_price - (atr_val * float(stop_slippage))
+                            exit_order_type = 'STOP_MARKET'
+                            exit_reason = 'SL_TOUCH_BOTH'
+                            req_price = sl_price
+                        else:
+                            exit_price = tp_price
+                            exit_order_type = 'LIMIT'
+                            exit_reason = 'TP_TOUCH_BOTH'
+                            req_price = tp_price
+                    elif hit_sl:
+                        exit_price = sl_price if stop_slippage == Decimal("0") else sl_price - (atr_val * float(stop_slippage))
+                        exit_order_type = 'STOP_MARKET'
+                        exit_reason = 'STOP_LOSS'
+                        req_price = sl_price
+                    elif hit_tp:
+                        exit_price = tp_price
+                        exit_order_type = 'LIMIT'
+                        exit_reason = 'TAKE_PROFIT'
+                        req_price = tp_price
+
+            elif position == 'SHORT':
+                sl_price = entry_price * (1 + stop_loss)
+                tp_price = entry_price * (1 - take_profit)
+
+                if not is_entry_bar:
+                    if bar['open'] >= sl_price:
+                        exit_price = float(bar['open']) if stop_slippage == Decimal("0") else float(bar['open']) + (atr_val * float(stop_slippage))
+                        exit_reason = "STOP_LOSS_GAP"
+                        applied_slippage = stop_slippage
+                        exit_order_type = "STOP_MARKET"
+                        gap_fill = True
+                        req_price = sl_price
+                    elif bar['open'] <= tp_price:
+                        exit_price = tp_price
+                        exit_reason = "TAKE_PROFIT_GAP"
+                        applied_slippage = 0.0
+                        exit_order_type = "LIMIT"
+                        gap_fill = True
+                        req_price = tp_price
+
+                if exit_price is None:
+                    hit_sl = bar['high'] >= sl_price
+                    hit_tp = bar['low'] <= tp_price
+
+                    if hit_sl and hit_tp:
+                        sl_first = True if mode in ('pessimistic', 'base') else (False if mode == 'optimistic' else (bar['high'] - bar['open'] <= bar['open'] - bar['low']))
+                        if sl_first:
+                            exit_price = sl_price if stop_slippage == Decimal("0") else sl_price + (atr_val * float(stop_slippage))
+                            exit_order_type = 'STOP_MARKET'
+                            exit_reason = 'SL_TOUCH_BOTH'
+                            req_price = sl_price
+                        else:
+                            exit_price = tp_price
+                            exit_order_type = 'LIMIT'
+                            exit_reason = 'TP_TOUCH_BOTH'
+                            req_price = tp_price
+                    elif hit_sl:
+                        exit_price = sl_price if stop_slippage == Decimal("0") else sl_price + (atr_val * float(stop_slippage))
+                        exit_order_type = 'STOP_MARKET'
+                        exit_reason = 'STOP_LOSS'
+                        req_price = sl_price
+                    elif hit_tp:
+                        exit_price = tp_price
+                        exit_order_type = 'LIMIT'
+                        exit_reason = 'TAKE_PROFIT'
+                        req_price = tp_price
+
+            if exit_price is not None:
+                gross_return = (exit_price - entry_price) / entry_price if position == 'LONG' else (entry_price - exit_price) / entry_price
+                net_return = gross_return - (2 * fee_rate)
+                exit_fee_amount = exit_price * intended_quantity * fee_rate
+
+                exit_fill_obj = {
+                    'bar_index': i,
+                    'order_type': exit_order_type,
+                    'requested_price': req_price,
+                    'fill_price': exit_price,
+                    'fee': exit_fee_amount,
+                    'quantity': intended_quantity,
+                    'last_observed_mark': None,
+                    'mode': mode,
+                    'gap_fill': gap_fill,
+                    'reason': exit_reason,
+                    'terminal_value_unverified': False,
+                    'liquidity_diagnostics': {'exit_liquidity_modeled': False}
+                }
+
+                entry_notional = Decimal(str(entry_fill_obj['quantity'])) * Decimal(str(entry_fill_obj['fill_price']))
+                exit_notional = Decimal(str(intended_quantity)) * Decimal(str(exit_price))
+                if entry_current_position_direction.lower() == 'long':
+                    gross_pnl_exit = exit_notional - entry_notional
+                else:
+                    gross_pnl_exit = entry_notional - exit_notional
+                current_cash += entry_notional + gross_pnl_exit - Decimal(str(exit_fee_amount))
+                current_gross_exposure = Decimal("0")
+                current_position_count = 0
+
+                trades.append({
+                    'entry_time': entry_time,
+                    'exit_time': bar['open_time'] if 'open_time' in bar else bar.name,
+                    'entry_price': entry_price,
+                    'exit_price': exit_price,
+                    'quantity': intended_quantity,
+                    'direction': 'long' if entry_current_position_direction.lower() == 'long' else 'short',
+                    'entry_fee': entry_fill_obj.get('fee', 0.0),
+                    'exit_fee': exit_fee_amount,
+                    'net_return': net_return,
+                    'exit_reason': exit_reason,
+                    'entry_fill': entry_fill_obj,
+                    'exit_fill': exit_fill_obj
+                })
+                if shadow_tracker:
+                    _exit_dir = 'long' if entry_current_position_direction.lower() == 'long' else 'short'
+                    shadow_tracker.record_exit(
+                        fill_price=Decimal(str(exit_price)),
+                        quantity=Decimal(str(intended_quantity)),
+                        fee=Decimal(str(exit_fee_amount)),
+                        direction=_exit_dir
+                    )
+                position = None
+                entry_fill_obj = None
+
+        # 4. Current-close signals scheduled for next open
+        sig = bar['signal']
+        if position is not None:
+            if (position == 'LONG' and sig == -1) or (position == 'SHORT' and sig == 1):
+                pending_exit = {'reason': 'SIGNAL_REVERSAL', 'order_type': 'MARKET'}
+            elif sig == -2:
+                pending_exit = {'reason': 'SIGNAL_FORCE_CLOSE', 'order_type': 'MARKET'}
+            else:
+                pending_exit = None
+        else:
+            pending_exit = None
+            if sig in [1, -1]:
+                pending_entry = sig
+                pending_entry_signal_row = bar
+            else:
+                pending_entry = None
+                pending_entry_signal_row = None
+
+        # 5. Record bar close for shadow tracker
+        if shadow_tracker:
+            shadow_tracker.record_bar_close(bar['close'], timestamp=bar.name)
+
+    # 6. Final boundary closure
+    if position is not None and len(df) > 0:
+        last_row = df.iloc[-1]
+        req_px = float(last_row['close'])
+        atr_val = float(Decimal(str(last_row['atr']))) if 'atr' in last_row else 0.0
+        if position.lower() == 'long':
+            exit_price = req_px if stop_slippage == Decimal("0") else req_px - (atr_val * float(stop_slippage))
+        else:
+            exit_price = req_px if stop_slippage == Decimal("0") else req_px + (atr_val * float(stop_slippage))
+
+        gross_return = (exit_price - entry_price) / entry_price if position.lower() == 'long' else (entry_price - exit_price) / entry_price
+        net_return = gross_return - (2 * fee_rate)
+        bndry_exit_fee = exit_price * intended_quantity * fee_rate
+        exit_fill_obj = {
+            'bar_index': len(df) - 1,
+            'order_type': 'MARKET_FORCE_CLOSE',
+            'requested_price': req_px,
+            'fill_price': exit_price,
+            'fee': bndry_exit_fee,
+            'quantity': intended_quantity,
+            'mode': mode,
+            'gap_fill': False,
+            'reason': 'BOUNDARY_CLOSE',
+            'liquidity_diagnostics': {'exit_liquidity_modeled': False}
+        }
+
+        entry_notional = Decimal(str(entry_fill_obj['quantity'])) * Decimal(str(entry_fill_obj['fill_price']))
+        exit_notional = Decimal(str(intended_quantity)) * Decimal(str(exit_price))
+        if entry_current_position_direction.lower() == 'long':
+            gross_pnl_exit = exit_notional - entry_notional
+        else:
+            gross_pnl_exit = entry_notional - exit_notional
+        current_cash += entry_notional + gross_pnl_exit - Decimal(str(bndry_exit_fee))
+        current_gross_exposure = Decimal("0")
+        current_position_count = 0
+
+        trades.append({
+            'entry_time': entry_time,
+            'exit_time': last_row['open_time'] if 'open_time' in last_row else last_row.name,
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'quantity': intended_quantity,
+            'direction': 'long' if entry_current_position_direction.lower() == 'long' else 'short',
+            'entry_fee': entry_fill_obj.get('fee', 0.0) if entry_fill_obj else 0.0,
+            'exit_fee': bndry_exit_fee,
+            'net_return': net_return,
+            'exit_reason': 'BOUNDARY_CLOSE',
+            'entry_fill': entry_fill_obj,
+            'exit_fill': exit_fill_obj
+        })
+        if shadow_tracker:
+            _bndry_dir = 'long' if entry_current_position_direction.lower() == 'long' else 'short'
+            shadow_tracker.record_exit(
+                fill_price=Decimal(str(exit_price)),
+                quantity=Decimal(str(intended_quantity)),
+                fee=Decimal(str(bndry_exit_fee)),
+                direction=_bndry_dir
+            )
+        position = None
+        entry_fill_obj = None
+
+    if track_shadow_ledger:
+        shadow_report = shadow_tracker.get_report(trades) if shadow_tracker else None
+        return trades, rejected_events, decision_traces, shadow_report
+
+    return trades, rejected_events, decision_traces
+
+
 def simulate_trades(
     df_with_signals, 
     mode='base', 
@@ -207,8 +816,14 @@ def simulate_trades(
     intended_quantity=1.0,
     initial_cash=1000000000.0,
     track_shadow_ledger=False,
-    shadow_ledger_config=None
+    shadow_ledger_config=None,
+    execution_model='v1_legacy'
 ):
+    if execution_model not in ('v1_legacy', 'v2_causal'):
+        raise ValueError(
+            f"Unknown execution_model: {execution_model!r}. Must be 'v1_legacy' or 'v2_causal'."
+        )
+
     entry_slippage = Decimal(str(entry_slippage))
     stop_slippage = Decimal(str(stop_slippage))
 
@@ -266,7 +881,25 @@ def simulate_trades(
     
     if 'signal' not in df.columns:
         raise ValueError("ATR column required when entry_slippage or stop_slippage is non-zero")
-        
+
+    if execution_model == 'v2_causal':
+        return _simulate_trades_v2_causal(
+            df=df,
+            mode=mode,
+            fee_rate=fee_rate,
+            entry_slippage=entry_slippage,
+            stop_slippage=stop_slippage,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            delisted_info=delisted_info,
+            liquidity_config=liquidity_config,
+            bars_per_day=bars_per_day,
+            intended_quantity=intended_quantity,
+            initial_cash=initial_cash,
+            track_shadow_ledger=track_shadow_ledger,
+            shadow_tracker=shadow_tracker
+        )
+
     for i in range(len(df) - 1):
         current_row = df.iloc[i]
         next_row = df.iloc[i + 1]
